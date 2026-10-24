@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use crate::store::{ApiFormat, ModelInfo, Proxy, Role};
+use crate::store::{ApiFormat, ModelInfo, Proxy, ReasoningEffort, Role};
 
 /// Events emitted while a chat completion streams.
 #[derive(Debug, Clone)]
@@ -128,6 +128,7 @@ fn completion_budget_field(model: &str) -> &'static str {
 /// vendor accepts (`max_tokens` vs `max_output_tokens`, a `system` message vs
 /// the Responses `instructions`, the Anthropic top-level `system`) differ, and
 /// a silently dropped system prompt is hard to notice at runtime.
+#[allow(clippy::too_many_arguments)]
 fn build_request(
     api: ApiFormat,
     base_url: &str,
@@ -136,6 +137,7 @@ fn build_request(
     max_tokens: u32,
     system_prompt: &str,
     temperature: Option<f64>,
+    reasoning: Option<ReasoningEffort>,
 ) -> (String, serde_json::Value) {
     let base = normalize_base(base_url);
     let system = system_text(system_prompt, messages);
@@ -155,6 +157,9 @@ fn build_request(
                 "messages": conversation,
             });
             body[completion_budget_field(model)] = serde_json::json!(max_tokens);
+            if let Some(effort) = reasoning {
+                body["reasoning_effort"] = serde_json::json!(effort.wire());
+            }
             (format!("{base}/chat/completions"), body)
         }
         ApiFormat::OpenAiResponses => {
@@ -168,6 +173,9 @@ fn build_request(
             });
             if !system.is_empty() {
                 body["instructions"] = serde_json::Value::String(system);
+            }
+            if let Some(effort) = reasoning {
+                body["reasoning"] = serde_json::json!({ "effort": effort.wire() });
             }
             (format!("{base}/responses"), body)
         }
@@ -183,6 +191,16 @@ fn build_request(
             if !system.is_empty() {
                 body["system"] = serde_json::Value::String(system);
             }
+            if let Some(effort) = reasoning {
+                // Extended thinking is Anthropic's equivalent of an effort
+                // setting; the budget must leave room under max_tokens.
+                let budget = effort.thinking_budget();
+                body["thinking"] = serde_json::json!({
+                    "type": "enabled",
+                    "budget_tokens": budget,
+                });
+                body["max_tokens"] = serde_json::json!(max_tokens.max(budget + 1024));
+            }
             (format!("{base}/messages"), body)
         }
     };
@@ -193,7 +211,11 @@ fn build_request(
             ApiFormat::AnthropicMessages => temperature.clamp(0.0, 1.0),
             _ => temperature,
         };
-        body["temperature"] = serde_json::json!(temperature);
+        // Extended thinking requires the provider's default sampling; sending
+        // a temperature alongside it is rejected by Claude.
+        if !(api == ApiFormat::AnthropicMessages && reasoning.is_some()) {
+            body["temperature"] = serde_json::json!(temperature);
+        }
     }
     (url, body)
 }
@@ -210,6 +232,8 @@ pub struct ChatRequest {
     pub system_prompt: String,
     /// `None` leaves the provider's default sampling temperature.
     pub temperature: Option<f64>,
+    /// Requested reasoning effort; `None` leaves it to the model.
+    pub reasoning: Option<ReasoningEffort>,
     pub proxy: Proxy,
     pub cancel: Arc<AtomicBool>,
 }
@@ -462,6 +486,7 @@ pub fn stream_chat(request: ChatRequest) -> async_channel::Receiver<StreamEvent>
         max_tokens,
         system_prompt,
         temperature,
+        reasoning,
         proxy,
         cancel,
     } = request;
@@ -502,6 +527,7 @@ pub fn stream_chat(request: ChatRequest) -> async_channel::Receiver<StreamEvent>
                 max_tokens,
                 &system_prompt,
                 temperature,
+                reasoning,
             );
             let request = authorize(client.post(&url).json(&body), api, &api_key);
             // Waiting for response headers is part of "the stream is silent":
@@ -623,6 +649,7 @@ mod tests {
             4096,
             system_prompt,
             temperature,
+            None,
         );
         body
     }
@@ -673,6 +700,7 @@ mod tests {
             1024,
             "",
             None,
+            None,
         );
         assert_eq!(body["max_completion_tokens"], 1024);
         assert!(body.get("max_tokens").is_none(), "{body}");
@@ -717,6 +745,41 @@ mod tests {
         assert_eq!(body["temperature"], 1.7);
     }
 
+    /// Reasoning effort maps to each shape's own vocabulary; Claude uses an
+    /// extended-thinking budget and must drop a custom temperature.
+    #[test]
+    fn reasoning_effort_maps_per_shape() {
+        let messages = vec![(Role::User, "你好".to_string())];
+        for api in ApiFormat::ALL {
+            let (_, body) = build_request(
+                api,
+                "http://host/v1",
+                "mock-mini",
+                &messages,
+                4096,
+                "",
+                Some(0.2),
+                Some(ReasoningEffort::High),
+            );
+            match api {
+                ApiFormat::OpenAiCompletions => {
+                    assert_eq!(body["reasoning_effort"], "high", "{body}");
+                    assert_eq!(body["temperature"], 0.2, "{body}");
+                }
+                ApiFormat::OpenAiResponses => {
+                    assert_eq!(body["reasoning"]["effort"], "high", "{body}");
+                    assert_eq!(body["temperature"], 0.2, "{body}");
+                }
+                ApiFormat::AnthropicMessages => {
+                    assert_eq!(body["thinking"]["type"], "enabled", "{body}");
+                    assert_eq!(body["thinking"]["budget_tokens"], 8192, "{body}");
+                    assert_eq!(body["max_tokens"], 9216, "{body}");
+                    assert!(body.get("temperature").is_none(), "{body}");
+                }
+            }
+        }
+    }
+
     /// An unset system prompt or temperature must produce no field at all, not
     /// an empty string or a zero temperature that would change the sampling.
     #[test]
@@ -726,6 +789,9 @@ mod tests {
             assert!(body.get("temperature").is_none(), "{api:?}");
             assert!(body.get("instructions").is_none(), "{api:?}");
             assert!(body.get("system").is_none(), "{api:?}");
+            assert!(body.get("reasoning").is_none(), "{api:?}");
+            assert!(body.get("reasoning_effort").is_none(), "{api:?}");
+            assert!(body.get("thinking").is_none(), "{api:?}");
             if let Some(messages) = body.get("messages").and_then(|value| value.as_array()) {
                 assert!(
                     messages.iter().all(|message| message["role"] != "system"),
@@ -749,6 +815,7 @@ mod tests {
                 &messages,
                 4096,
                 "新设定",
+                None,
                 None,
             );
             let merged = "新设定\n\n旧设定";

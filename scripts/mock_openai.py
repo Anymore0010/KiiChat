@@ -83,7 +83,8 @@ class Handler(BaseHTTPRequestHandler):
             )
         print(
             "POST %s model=%s stream=%s auth=%s x-api-key=%s "
-            "max_tokens=%s max_output_tokens=%s temperature=%s system=%r"
+            "max_tokens=%s max_output_tokens=%s temperature=%s system=%r "
+            "reasoning_effort=%s reasoning=%s thinking=%s"
             % (
                 path,
                 payload.get("model"),
@@ -94,6 +95,9 @@ class Handler(BaseHTTPRequestHandler):
                 payload.get("max_output_tokens"),
                 payload.get("temperature"),
                 instructions,
+                payload.get("reasoning_effort"),
+                payload.get("reasoning"),
+                payload.get("thinking"),
             ),
             flush=True,
         )
@@ -109,6 +113,9 @@ class Handler(BaseHTTPRequestHandler):
                 )
             if "temperature" in payload and not isinstance(payload["temperature"], (int, float)):
                 return self._json({"error": {"message": "temperature 必须是数字"}}, 400)
+            effort = payload.get("reasoning_effort")
+            if effort is not None and effort not in ("low", "medium", "high"):
+                return self._json({"error": {"message": "reasoning_effort 不合法"}}, 400)
             self._sse_headers()
             if SLOW:
                 for index in range(30):
@@ -140,6 +147,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(
                     {"error": {"message": "responses 不应该收到 max_tokens"}}, 400
                 )
+            reasoning = payload.get("reasoning")
+            if reasoning is not None and (
+                not isinstance(reasoning, dict)
+                or reasoning.get("effort") not in ("low", "medium", "high")
+            ):
+                return self._json({"error": {"message": "reasoning.effort 不合法"}}, 400)
             self._sse_headers()
             sse(self, [{"type": "response.created"}])
             sse(self, [{"type": "response.output_text.delta", "delta": "来自 "}])
@@ -156,6 +169,16 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"error": {"message": "缺少 anthropic-version"}}, 400)
             if not payload.get("max_tokens"):
                 return self._json({"error": {"message": "messages 需要 max_tokens"}}, 400)
+            thinking = payload.get("thinking")
+            if thinking is not None:
+                if not isinstance(thinking, dict) or not isinstance(
+                    thinking.get("budget_tokens"), int
+                ):
+                    return self._json({"error": {"message": "thinking 不合法"}}, 400)
+                if payload["max_tokens"] <= thinking["budget_tokens"]:
+                    return self._json(
+                        {"error": {"message": "max_tokens 必须大于 thinking 预算"}}, 400
+                    )
             self._sse_headers()
             sse(self, [{"type": "message_start"}])
             sse(self, [{"type": "content_block_start", "index": 0}])

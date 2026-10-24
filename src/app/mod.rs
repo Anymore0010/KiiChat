@@ -35,7 +35,9 @@ use gpui_component::{
 
 use crate::api::{self, StreamEvent};
 use crate::icons;
-use crate::store::{ApiFormat, ModelInfo, Msg, Provider, Proxy, Role, Session, Store, Theme};
+use crate::store::{
+    ApiFormat, ModelInfo, Msg, Provider, Proxy, ReasoningEffort, Role, Session, Store, Theme,
+};
 use crate::theme::{apply_theme, theme_mode};
 
 const SIDEBAR_WIDTH: f32 = 232.;
@@ -98,6 +100,17 @@ struct Editing {
 enum Confirm {
     Session { id: String, title: String },
     Provider { id: String, name: String },
+}
+
+/// Which sheet of the model picker is showing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PickerPage {
+    /// Two rows: model and reasoning effort.
+    Root,
+    /// Searchable list of every provider's models.
+    Models,
+    /// Reasoning effort choices.
+    Effort,
 }
 
 /// One model in the chat picker, tagged with the provider that serves it.
@@ -171,6 +184,8 @@ pub struct KiiChat {
     picker_search: Entity<InputState>,
     /// Whether the composer's model picker is open.
     picker_open: bool,
+    /// Which page of the picker is showing.
+    picker_page: PickerPage,
     /// Window-space bounds of the model pill, used to anchor the floating
     /// picker above it. Updated during prepaint.
     model_pill_bounds: Bounds<Pixels>,
@@ -309,6 +324,7 @@ impl KiiChat {
             models_search,
             picker_search,
             picker_open: false,
+            picker_page: PickerPage::Root,
             model_pill_bounds: Bounds::default(),
             thinking_open: HashSet::new(),
             max_tokens_input,
@@ -411,6 +427,11 @@ impl KiiChat {
             .and_then(|session| session.model.clone())
             .filter(|model| provider.has_model(model))
             .or_else(|| provider.models.first().map(|model| model.id.clone()))
+    }
+
+    /// The conversation's reasoning effort; `None` means provider default.
+    fn effective_reasoning(&self) -> Option<ReasoningEffort> {
+        self.current_session().and_then(|session| session.reasoning)
     }
 
     // ----------------------------------------------------------------- theme
@@ -654,6 +675,7 @@ impl KiiChat {
         cx: &mut Context<Self>,
     ) {
         let cancel = Arc::new(AtomicBool::new(false));
+        let reasoning = self.store.session(&session_id).and_then(|session| session.reasoning);
         self.stream_seq += 1;
         let stream_id = self.stream_seq;
         self.stream = Some(Stream {
@@ -675,6 +697,7 @@ impl KiiChat {
             max_tokens,
             system_prompt: self.store.system_prompt.clone(),
             temperature: self.store.temperature,
+            reasoning,
             proxy: self.store.proxy.clone(),
             cancel,
         });
@@ -840,6 +863,7 @@ impl KiiChat {
         self.current = Some(id);
         self.page = Page::Chat;
         self.picker_open = false;
+        self.picker_page = PickerPage::Root;
         self.confirm = None;
         self.renaming = None;
         self.sync_transcript(true);
@@ -854,6 +878,8 @@ impl KiiChat {
         self.cancel_stream(cx);
         self.current = Some(id.to_string());
         self.page = Page::Chat;
+        self.picker_open = false;
+        self.picker_page = PickerPage::Root;
         self.renaming = None;
         self.confirm = None;
         self.sync_transcript(true);
@@ -1302,8 +1328,15 @@ impl KiiChat {
         rows
     }
 
-    fn open_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn open_picker(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         self.picker_open = true;
+        self.picker_page = PickerPage::Root;
+        cx.notify();
+    }
+
+    /// Opens the model sheet and puts the cursor in its search field.
+    pub(super) fn open_model_list(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.picker_page = PickerPage::Models;
         self.picker_search.update(cx, |input, cx| {
             input.set_value("", window, cx);
             input.focus(window, cx);
@@ -1311,9 +1344,21 @@ impl KiiChat {
         cx.notify();
     }
 
+    /// Opens the reasoning-effort sheet.
+    pub(super) fn open_effort_list(&mut self, cx: &mut Context<Self>) {
+        self.picker_page = PickerPage::Effort;
+        cx.notify();
+    }
+
+    pub(super) fn back_to_picker_root(&mut self, cx: &mut Context<Self>) {
+        self.picker_page = PickerPage::Root;
+        cx.notify();
+    }
+
     fn close_picker(&mut self, cx: &mut Context<Self>) {
         if self.picker_open {
             self.picker_open = false;
+            self.picker_page = PickerPage::Root;
             cx.notify();
         }
     }
@@ -1334,9 +1379,28 @@ impl KiiChat {
             session.model = Some(model_id.to_string());
         }
         self.picker_open = false;
+        self.picker_page = PickerPage::Root;
         self.persist(cx);
         self.composer
             .update(cx, |input, cx| input.focus(window, cx));
+        cx.notify();
+    }
+
+    /// Stores the conversation's reasoning effort and closes the picker.
+    pub(super) fn pick_effort(
+        &mut self,
+        effort: Option<ReasoningEffort>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(id) = self.current.clone() else {
+            return;
+        };
+        if let Some(session) = self.store.session_mut(&id) {
+            session.reasoning = effort;
+        }
+        self.picker_open = false;
+        self.picker_page = PickerPage::Root;
+        self.persist(cx);
         cx.notify();
     }
 

@@ -100,6 +100,55 @@ impl ApiFormat {
     }
 }
 
+/// How much reasoning effort a conversation asks the provider for.
+///
+/// `None` on [`Session`] means "let the provider decide". The value is mapped
+/// per API shape: `reasoning_effort` on Chat Completions, `reasoning.effort` on
+/// Responses, and an extended-thinking budget on Anthropic Messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningEffort {
+    Low,
+    Medium,
+    High,
+}
+
+impl ReasoningEffort {
+    /// The value OpenAI-compatible shapes use.
+    pub fn wire(self) -> &'static str {
+        match self {
+            ReasoningEffort::Low => "low",
+            ReasoningEffort::Medium => "medium",
+            ReasoningEffort::High => "high",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ReasoningEffort::Low => "低",
+            ReasoningEffort::Medium => "中",
+            ReasoningEffort::High => "高",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            ReasoningEffort::Low => "更快，推理更少",
+            ReasoningEffort::Medium => "速度与深度平衡",
+            ReasoningEffort::High => "更深入，可能更慢",
+        }
+    }
+
+    /// Anthropic extended-thinking budget for this effort.
+    pub fn thinking_budget(self) -> u32 {
+        match self {
+            ReasoningEffort::Low => 1024,
+            ReasoningEffort::Medium => 4096,
+            ReasoningEffort::High => 8192,
+        }
+    }
+}
+
 /// One model the provider exposes, plus optional limits from `/models`.
 ///
 /// Older configs stored a bare id string; both shapes deserialize.
@@ -406,6 +455,9 @@ pub struct Session {
     pub provider_id: Option<String>,
     #[serde(default)]
     pub model: Option<String>,
+    /// Requested reasoning effort; `None` lets the provider decide.
+    #[serde(default)]
+    pub reasoning: Option<ReasoningEffort>,
     #[serde(default)]
     pub messages: Vec<Msg>,
 }
@@ -417,6 +469,7 @@ impl Session {
             title: "新对话".into(),
             provider_id: None,
             model: None,
+            reasoning: None,
             messages: Vec::new(),
         }
     }
@@ -717,6 +770,25 @@ mod tests {
         let parsed: Store = serde_json::from_str(&text).expect("parse");
         assert_eq!(parsed.system_prompt, "你是一个简洁的中文助手。");
         assert_eq!(parsed.temperature, Some(0.3));
+    }
+
+    /// A session written before reasoning existed must still load, and the
+    /// effort must round-trip as the same wire name.
+    #[test]
+    fn session_reasoning_is_optional_and_round_trips() {
+        let text = r#"{"id":"s","title":"旧会话"}"#;
+        let session: Session = serde_json::from_str(text).expect("parse");
+        assert_eq!(session.reasoning, None);
+
+        let mut session = Session::new();
+        session.reasoning = Some(ReasoningEffort::High);
+        let encoded = serde_json::to_string(&session).expect("serialize");
+        let parsed: Session = serde_json::from_str(&encoded).expect("parse");
+        assert_eq!(parsed.reasoning, Some(ReasoningEffort::High));
+        assert_eq!(
+            serde_json::to_string(&ReasoningEffort::Medium).unwrap(),
+            "\"medium\""
+        );
     }
 
     #[test]

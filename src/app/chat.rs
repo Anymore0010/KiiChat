@@ -352,10 +352,8 @@ impl KiiChat {
         .into_any_element()
     }
 
-    /// The model picker: a deferred, anchored popup above the composer's model
-    /// pill. It lists every provider's models, so switching endpoint and model
-    /// is one choice.
-    pub(super) fn render_model_picker(&self, cx: &mut Context<Self>) -> AnyElement {
+    /// The model sheet: every provider's models, filtered by the search box.
+    fn render_picker_models(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme();
         let muted = theme.muted_foreground;
         let rows = self.picker_rows(cx);
@@ -429,7 +427,6 @@ impl KiiChat {
             this.picker_open = false;
             this.show_settings(window, cx);
         });
-        let close = cx.listener(|this, _, _, cx| this.close_picker(cx));
 
         let panel_body: AnyElement = if empty {
             v_flex()
@@ -471,21 +468,7 @@ impl KiiChat {
             .border_1()
             .border_color(theme.border)
             .bg(theme.popover)
-            .child(
-                h_flex()
-                    .justify_between()
-                    .items_center()
-                    .child(div().text_sm().font_semibold().child("选择模型"))
-                    .child(
-                        Button::new("close-picker")
-                            .icon(IconName::Close)
-                            .ghost()
-                            .small()
-                            .tooltip("关闭")
-                            .accessibility_label("关闭模型选择")
-                            .on_click(close),
-                    ),
-            )
+            .child(self.picker_header("模型", cx))
             .child(Input::new(&self.picker_search))
             .child(
                 div()
@@ -518,9 +501,11 @@ impl KiiChat {
                     }),
             );
 
-        // The pill's bounds are in window space; anchoring the popup's
-        // bottom-right corner there makes it grow upward from the composer,
-        // over the transcript, with no layout shift.
+        self.anchor_popup(panel.into_any_element())
+    }
+
+    /// Opens the popup above the model pill without touching layout.
+    fn anchor_popup(&self, panel: AnyElement) -> AnyElement {
         let anchor = gpui::point(
             self.model_pill_bounds.origin.x + self.model_pill_bounds.size.width,
             self.model_pill_bounds.origin.y,
@@ -536,6 +521,231 @@ impl KiiChat {
         .into_any_element()
     }
 
+    /// Header shared by the model and reasoning sheets.
+    fn picker_header(&self, title: &'static str, cx: &mut Context<Self>) -> AnyElement {
+        let back = cx.listener(|this, _, _, cx| this.back_to_picker_root(cx));
+        let close = cx.listener(|this, _, _, cx| this.close_picker(cx));
+        h_flex()
+            .justify_between()
+            .items_center()
+            .gap_2()
+            .child(
+                Button::new("picker-back")
+                    .icon(IconName::ArrowLeft)
+                    .ghost()
+                    .small()
+                    .tooltip("返回")
+                    .accessibility_label("返回")
+                    .on_click(back),
+            )
+            .child(div().flex_1().min_w_0().text_sm().font_semibold().child(title))
+            .child(
+                Button::new("close-picker")
+                    .icon(IconName::Close)
+                    .ghost()
+                    .small()
+                    .tooltip("关闭")
+                    .accessibility_label("关闭模型选择")
+                    .on_click(close),
+            )
+            .into_any_element()
+    }
+
+    /// Root sheet: model on one row, reasoning effort on the next.
+    fn render_picker_root(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let muted = theme.muted_foreground;
+        let hover = theme.secondary;
+        let model = self
+            .effective_model()
+            .unwrap_or_else(|| "未选择模型".into());
+        let effort = self
+            .effective_reasoning()
+            .map(|effort| effort.label())
+            .unwrap_or("默认");
+
+        let open_models = cx.listener(|this, _, window, cx| this.open_model_list(window, cx));
+        let open_effort = cx.listener(|this, _, _, cx| this.open_effort_list(cx));
+
+        let model_row = h_flex()
+            .id("picker-row-model")
+            .role(gpui::Role::Button)
+            .aria_label("模型")
+            .justify_between()
+            .items_center()
+            .gap_3()
+            .px_3()
+            .py_2()
+            .rounded(theme.radius)
+            .cursor_pointer()
+            .hover(move |style| style.bg(hover))
+            .on_click(open_models)
+            .child(div().text_sm().child("模型"))
+            .child(
+                h_flex()
+                    .flex_none()
+                    .gap_1()
+                    .items_center()
+                    .child(
+                        div()
+                            .max_w(px(190.))
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .text_xs()
+                            .text_color(muted)
+                            .child(model),
+                    )
+                    .child(Icon::new(IconName::ChevronRight).small()),
+            );
+
+        let effort_row = h_flex()
+            .id("picker-row-effort")
+            .role(gpui::Role::Button)
+            .aria_label("推理等级")
+            .justify_between()
+            .items_center()
+            .gap_3()
+            .px_3()
+            .py_2()
+            .rounded(theme.radius)
+            .cursor_pointer()
+            .hover(move |style| style.bg(hover))
+            .on_click(open_effort)
+            .child(div().text_sm().child("推理等级"))
+            .child(
+                h_flex()
+                    .flex_none()
+                    .gap_1()
+                    .items_center()
+                    .child(div().text_xs().text_color(muted).child(effort))
+                    .child(Icon::new(IconName::ChevronRight).small()),
+            );
+
+        v_flex()
+            .gap_1()
+            .p_1()
+            .child(model_row)
+            .child(effort_row)
+            .into_any_element()
+    }
+
+    /// Reasoning-effort sheet.
+    fn render_picker_effort(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let muted = theme.muted_foreground;
+        let accent = theme.accent;
+        let accent_fg = theme.accent_foreground;
+        let hover = theme.secondary;
+        let current = self.effective_reasoning();
+        let options: [(Option<ReasoningEffort>, &str, &str); 4] = [
+            (None, "默认", "不指定，由接口与模型决定"),
+            (Some(ReasoningEffort::Low), "低", ReasoningEffort::Low.description()),
+            (
+                Some(ReasoningEffort::Medium),
+                "中",
+                ReasoningEffort::Medium.description(),
+            ),
+            (
+                Some(ReasoningEffort::High),
+                "高",
+                ReasoningEffort::High.description(),
+            ),
+        ];
+
+        let rows: Vec<AnyElement> = options
+            .into_iter()
+            .enumerate()
+            .map(|(index, (value, label, description))| {
+                let selected = current == value;
+                let pick = cx.listener(move |this, _, _, cx| this.pick_effort(value, cx));
+                h_flex()
+                    .id(("pick-effort", index))
+                    .role(gpui::Role::Button)
+                    .aria_label(format!("推理等级：{label}"))
+                    .justify_between()
+                    .items_center()
+                    .gap_3()
+                    .px_3()
+                    .py_2()
+                    .rounded(theme.radius)
+                    .cursor_pointer()
+                    .when(selected, |this| this.bg(accent).text_color(accent_fg))
+                    .when(!selected, |this| {
+                        this.hover(move |style| style.bg(hover))
+                    })
+                    .on_click(pick)
+                    .child(
+                        v_flex()
+                            .gap(px(1.))
+                            .child(div().text_sm().child(label))
+                            .child(div().text_xs().text_color(if selected {
+                                accent_fg
+                            } else {
+                                muted
+                            }).child(description)),
+                    )
+                    .when(selected, |this| {
+                        this.child(Icon::new(IconName::Check).small())
+                    })
+                    .into_any_element()
+            })
+            .collect();
+
+        v_flex()
+            .gap_2()
+            .child(self.picker_header("推理等级", cx))
+            .child(v_flex().gap(px(2.)).children(rows))
+            .child(
+                div()
+                    .px_1()
+                    .text_xs()
+                    .text_color(muted)
+                    .child("默认表示不指定，由接口决定。"),
+            )
+            .into_any_element()
+    }
+
+    /// Public entry: picks the sheet and floats it above the pill.
+    pub(super) fn render_model_picker(&self, cx: &mut Context<Self>) -> AnyElement {
+        match self.picker_page {
+            PickerPage::Models => self.render_picker_models(cx),
+            PickerPage::Root => {
+                let body = self.render_picker_root(cx);
+                let theme = cx.theme();
+                let panel = v_flex()
+                    .id("model-picker-panel")
+                    .occlude()
+                    .w(px(330.))
+                    .max_w(relative(0.92))
+                    .p_2()
+                    .rounded(px(12.))
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(theme.popover)
+                    .child(body)
+                    .into_any_element();
+                self.anchor_popup(panel)
+            }
+            PickerPage::Effort => {
+                let body = self.render_picker_effort(cx);
+                let theme = cx.theme();
+                let panel = v_flex()
+                    .id("model-picker-panel")
+                    .occlude()
+                    .w(px(340.))
+                    .max_w(relative(0.92))
+                    .p_2()
+                    .rounded(px(12.))
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(theme.popover)
+                    .child(body)
+                    .into_any_element();
+                self.anchor_popup(panel)
+            }
+        }
+    }
+
     /// The app's composer: a DSH-style card with the model pill and a round
     /// send / stop control on its bottom row.
     pub(super) fn render_composer(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -546,9 +756,14 @@ impl KiiChat {
         let has_draft = !self.composer.read(cx).value().trim().is_empty();
         let submit = cx.listener(|this, _, window, cx| this.submit_composer(window, cx));
         let stop = cx.listener(|this, _, _, cx| this.cancel_stream(cx));
-        let current = self
+        let model = self
             .effective_model()
             .unwrap_or_else(|| "选择模型".into());
+        let effort = self.effective_reasoning().map(|effort| effort.label());
+        let current = match effort {
+            Some(effort) => format!("{model} · {effort}"),
+            None => model,
+        };
         let provider = self
             .effective_provider_id()
             .and_then(|id| self.store.provider(&id))
@@ -567,7 +782,7 @@ impl KiiChat {
             .secondary()
             .small()
             .rounded(px(10.))
-            .accessibility_label("选择模型")
+            .accessibility_label("选择模型与推理等级")
             .on_click(toggle);
         // A tooltip over the pill would paint on top of the popup while the
         // popup is open; it is only useful as a closed-state affordance.
@@ -575,8 +790,8 @@ impl KiiChat {
             trigger
         } else {
             trigger.tooltip(match provider {
-                Some(provider) => format!("选择模型 · {provider}"),
-                None => "选择模型".to_string(),
+                Some(provider) => format!("模型与推理等级 · {provider}"),
+                None => "模型与推理等级".to_string(),
             })
         };
 
@@ -819,7 +1034,7 @@ impl KiiChat {
                     .text_color(theme.muted_foreground)
                     .text_center()
                     .child(if has_provider {
-                        "在下方输入消息，Enter 发送。点输入框右下角的模型名可以切换供应商与模型。"
+                        "在下方输入消息，Enter 发送。点输入框右下角的模型名可以切换供应商、模型与推理等级。"
                     } else {
                         "先点左侧栏底部的「设置」，到「模型」添加一个 OpenAI 兼容的接口，再回来对话。"
                     }),

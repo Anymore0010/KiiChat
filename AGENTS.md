@@ -120,13 +120,20 @@ scripts/              dev tooling: fake provider server + UI Automation / captur
 - **One model selector, across providers.** The composer is a custom
   borderless `Textarea` in a framed card (`render_composer`); Enter sends,
   Shift+Enter inserts a newline, and a rejected send keeps the draft.
-  `render_composer` / `render_model_picker` own the only selector: the panel
-  lists every provider's models, filters by model or provider name, and a row
-  binds both `session.provider_id` and `session.model`. 选择第一个 commits the
-  first filtered row. The pill lives in the composer's bottom row (DSH-style).
-  The popup is `deferred(anchored(...))` at `POPUP_PRIORITY`, positioned from
-  the pill's prepaint bounds, so it floats above the transcript and composer
-  without reflowing either; a transcript backdrop dismisses it.
+  `render_composer` / `render_model_picker` own the only selector. The popup
+  opens on a root sheet with two rows — 模型 and 推理等级 — and each opens its
+  own sub-sheet; 模型 lists every provider's models (filter by model or provider
+  name) and binds `session.provider_id` + `session.model`. 选择第一个 commits
+  the first filtered row. The pill lives in the composer's bottom row
+  (DSH-style). The popup is `deferred(anchored(...))` at `POPUP_PRIORITY`,
+  positioned from the pill's prepaint bounds, so it floats above the transcript
+  and composer without reflowing either; a transcript backdrop dismisses it.
+- **Reasoning effort is per session.** `Session.reasoning` is
+  `Option<ReasoningEffort>` (`low` / `medium` / `high`), chosen on the picker's
+  second sheet. Chat Completions gets `reasoning_effort`, Responses gets
+  `reasoning.effort`, and Anthropic gets `thinking.budget_tokens` (1024 / 4096 /
+  8192) with `max_tokens` raised above the budget and temperature suppressed.
+  Other compatible vendors may ignore or reject the field.
 - **Errors surface in the UI.** A failed reply is stored in `Msg.error`, shown
   inside the bubble with a red border, and its retry action becomes a red
   「重试」 text button.
@@ -309,6 +316,10 @@ Only what has been observed, with the evidence that showed it:
    need an explicit override. The mock only models the `max_tokens` path.
 8. **System prompt and temperature are global.** Per-conversation overrides are
    a product decision not yet taken; both fields live in `Store`, not `Session`.
+9. **Reasoning effort is best-effort outside OpenAI/Anthropic.** Chat
+   Completions sends `reasoning_effort` to every compatible vendor; providers
+   that do not understand it may ignore it or reject the request. Anthropic
+   models without extended thinking will reject the generated `thinking` field.
 
 ### Closed this session (2026-10-24)
 
@@ -330,15 +341,18 @@ Only what has been observed, with the evidence that showed it:
 - Empty successful replies become a red error with retry instead of placeholder
   assistant text being sent back as context.
 - Editing and retry are refused with a notice while a reply is streaming.
+- Model picker is now a two-level DSH-style popover: root rows for 模型 and
+  推理等级, each opening its own sheet. Reasoning effort is per session and
+  maps to `reasoning_effort`, `reasoning.effort`, or Anthropic thinking budget.
 - Settings moved into the sidebar footer; the same slot is 「返回对话」 on the
   settings page, and the title-bar slot is a collapsed-sidebar fallback / back
   button.
 - Filled primary buttons now use the app's accent blue: `apply_theme` rebuilds
   the cached `Theme.tokens` snapshot after writing the palette (the upstream
   theme cache kept `button_primary` black regardless of `colors.primary`).
-- `cargo test`: 25 unit tests covering the three request shapes, system merge,
-  deltas, SSE blocks, palette completeness, config compatibility and at-rest
-  key encoding.
+- `cargo test`: 27 unit tests covering the three request shapes, system merge,
+  reasoning effort, deltas, SSE blocks, palette completeness, config
+  compatibility and at-rest key encoding.
 
 ### Closed this session (2026-09-12)
 
