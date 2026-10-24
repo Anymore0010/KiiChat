@@ -37,6 +37,9 @@ pub struct Msg {
     /// Set when the response failed; rendered as the message's failure state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Set when the user stopped the completion before it finished.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub stopped: bool,
 }
 
 impl Msg {
@@ -47,8 +50,14 @@ impl Msg {
             content: content.into(),
             thinking: None,
             error: None,
+            stopped: false,
         }
     }
+}
+
+/// Serde helper: `bool` fields that predate a release must stay absent.
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Which request/response shape a provider speaks.
@@ -467,6 +476,12 @@ pub struct Store {
     /// Provider a new conversation starts with.
     #[serde(default)]
     pub selected_provider: Option<String>,
+    /// Prompt inserted ahead of every conversation's messages.
+    #[serde(default)]
+    pub system_prompt: String,
+    /// Sampling temperature; `None` leaves the provider's own default.
+    #[serde(default)]
+    pub temperature: Option<f64>,
     /// Color scheme, persisted across runs.
     #[serde(default)]
     pub theme: Theme,
@@ -661,6 +676,47 @@ mod tests {
         }"#;
         let msg: Msg = serde_json::from_str(text).expect("parse");
         assert!(msg.thinking.is_none());
+    }
+
+    /// A message from an earlier release has no `stopped` field, and a message
+    /// that was not stopped must not grow one in the file.
+    #[test]
+    fn stopped_is_optional_and_only_written_when_set() {
+        let text = r#"{"id": "m", "role": "assistant", "content": "partial"}"#;
+        let msg: Msg = serde_json::from_str(text).expect("parse");
+        assert!(!msg.stopped);
+
+        let fresh = Msg::new(Role::Assistant, "partial");
+        let encoded = serde_json::to_string(&fresh).expect("serialize");
+        assert!(!encoded.contains("stopped"), "{encoded}");
+
+        let mut stopped = fresh;
+        stopped.stopped = true;
+        let encoded = serde_json::to_string(&stopped).expect("serialize");
+        assert!(encoded.contains("\"stopped\":true"), "{encoded}");
+    }
+
+    /// Chat parameters are new fields: old configs must load, and the default
+    /// temperature must stay "provider default" (`None`), not 0.0.
+    #[test]
+    fn chat_parameters_default_empty() {
+        let text = r#"{"providers": [], "sessions": []}"#;
+        let store: Store = serde_json::from_str(text).expect("parse");
+        assert!(store.system_prompt.is_empty());
+        assert_eq!(store.temperature, None);
+    }
+
+    #[test]
+    fn chat_parameters_round_trip() {
+        let store = Store {
+            system_prompt: "你是一个简洁的中文助手。".into(),
+            temperature: Some(0.3),
+            ..Store::default()
+        };
+        let text = serde_json::to_string(&store).expect("serialize");
+        let parsed: Store = serde_json::from_str(&text).expect("parse");
+        assert_eq!(parsed.system_prompt, "你是一个简洁的中文助手。");
+        assert_eq!(parsed.temperature, Some(0.3));
     }
 
     #[test]

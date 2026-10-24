@@ -43,6 +43,9 @@ const SIDEBAR_WIDTH: f32 = 232.;
 /// Matches gpui-component's title bar height, so the window controls line up.
 const TITLE_BAR_HEIGHT: Pixels = px(34.);
 const DEFAULT_TITLE: &str = "新对话";
+/// The sidebar search box appears once the list is long enough to scan. The
+/// filter must use the same threshold, or a hidden box could hide rows.
+const SESSION_SEARCH_MIN: usize = 4;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
@@ -55,13 +58,15 @@ enum Page {
 enum Section {
     Appearance,
     Network,
+    Chat,
     Models,
 }
 
 impl Section {
-    const ALL: [(Section, &'static str, IconName); 3] = [
+    const ALL: [(Section, &'static str, IconName); 4] = [
         (Section::Appearance, "外观", IconName::Palette),
         (Section::Network, "网络", IconName::Globe),
+        (Section::Chat, "对话", IconName::Bot),
         (Section::Models, "模型", IconName::Cpu),
     ];
 
@@ -69,6 +74,7 @@ impl Section {
         match self {
             Section::Appearance => "外观",
             Section::Network => "网络",
+            Section::Chat => "对话",
             Section::Models => "模型",
         }
     }
@@ -77,6 +83,7 @@ impl Section {
         match self {
             Section::Appearance => "选择浅色或深色主题，设置会立即生效并保存。",
             Section::Network => "选择请求接口时使用的网络通道。",
+            Section::Chat => "设置全局系统提示词与采样温度，它们会附加到每次对话请求。",
             Section::Models => "添加任意 OpenAI 兼容的接口，点「获取模型」一键拉取模型列表。",
         }
     }
@@ -88,8 +95,17 @@ struct Editing {
     editor: Entity<TextareaState>,
 }
 
+/// A destructive action that needs an explicit second click.
+enum Confirm {
+    Session { id: String, title: String },
+    Provider { id: String, name: String },
+}
+
 /// One in-flight completion.
 struct Stream {
+    /// Monotonic id: a cancelled worker's late events must not reach the next
+    /// completion, which would append them to the wrong reply.
+    id: u64,
     session_id: String,
     message_id: String,
     cancel: Arc<AtomicBool>,
@@ -123,9 +139,22 @@ pub struct KiiChat {
     transcript: ListState,
     current: Option<String>,
     stream: Option<Stream>,
+    /// Id to hand the next completion; see [`Stream::id`].
+    stream_seq: u64,
     editing: Option<Editing>,
     editor: Editor,
     notice: Option<SharedString>,
+    /// Global system prompt and sampling temperature, edited in settings.
+    system_input: Entity<TextareaState>,
+    temperature_input: Entity<InputState>,
+    params_status: SharedString,
+    /// Sidebar search query.
+    session_search: Entity<InputState>,
+    /// Inline session rename: which row is open and the draft title.
+    rename_input: Entity<InputState>,
+    renaming: Option<String>,
+    /// A destructive action waiting for confirmation.
+    confirm: Option<Confirm>,
     name_input: Entity<InputState>,
     base_input: Entity<InputState>,
     key_input: Entity<InputState>,
@@ -164,6 +193,16 @@ impl KiiChat {
         let max_tokens_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder("4096")
         });
+        let system_input = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .auto_grow(2, 8)
+                .placeholder("例如：你是一个简洁、准确的中文助手。")
+        });
+        let temperature_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("0–2，留空使用接口默认值")
+        });
+        let session_search = cx.new(|cx| InputState::new(window, cx).placeholder("搜索会话"));
+        let rename_input = cx.new(|cx| InputState::new(window, cx).placeholder("会话名称"));
         // Each search box re-renders the view as it is typed into.
         let mut subscriptions = vec![cx.subscribe_in(
             &prompt,
@@ -172,7 +211,13 @@ impl KiiChat {
                 this.on_prompt_event(event, window, cx);
             },
         )];
-        let mut live_inputs = vec![&models_search, &picker_search, &base_input, &max_tokens_input];
+        let mut live_inputs = vec![
+            &models_search,
+            &picker_search,
+            &base_input,
+            &max_tokens_input,
+            &session_search,
+        ];
         for search in live_inputs.drain(..) {
             subscriptions.push(cx.subscribe_in(
                 search,
@@ -184,6 +229,38 @@ impl KiiChat {
                 },
             ));
         }
+        // Enter confirms an inline session rename, the same key that submits a
+        // message everywhere else in the app.
+        subscriptions.push(cx.subscribe_in(
+            &rename_input,
+            window,
+            |this: &mut Self, _, event: &InputEvent, _, cx| match event {
+                InputEvent::PressEnter { shift: false, .. } => this.submit_rename(cx),
+                InputEvent::Change => cx.notify(),
+                _ => {}
+            },
+        ));
+        // A "saved" status must not outlive an edit that has not been saved.
+        subscriptions.push(cx.subscribe_in(
+            &system_input,
+            window,
+            |this: &mut Self, _, event: &InputEvent, _, cx| {
+                if matches!(event, InputEvent::Change) && !this.params_status.is_empty() {
+                    this.params_status = SharedString::default();
+                    cx.notify();
+                }
+            },
+        ));
+        subscriptions.push(cx.subscribe_in(
+            &temperature_input,
+            window,
+            |this: &mut Self, _, event: &InputEvent, _, cx| {
+                if matches!(event, InputEvent::Change) && !this.params_status.is_empty() {
+                    this.params_status = SharedString::default();
+                    cx.notify();
+                }
+            },
+        ));
 
         let (store, warning) = Store::load();
         let mut this = Self {
@@ -194,9 +271,17 @@ impl KiiChat {
             transcript,
             current: None,
             stream: None,
+            stream_seq: 0,
             editing: None,
             editor: Editor::default(),
             notice: None,
+            system_input,
+            temperature_input,
+            params_status: SharedString::default(),
+            session_search,
+            rename_input,
+            renaming: None,
+            confirm: None,
             name_input,
             base_input,
             key_input,
@@ -208,6 +293,16 @@ impl KiiChat {
             max_tokens_input,
             _subscriptions: subscriptions,
         };
+        let system_prompt = this.store.system_prompt.clone();
+        if !system_prompt.is_empty() {
+            this.system_input
+                .update(cx, |input, cx| input.set_value(system_prompt, window, cx));
+        }
+        if let Some(temperature) = this.store.temperature {
+            this.temperature_input.update(cx, |input, cx| {
+                input.set_value(temperature.to_string(), window, cx);
+            });
+        }
         if let Proxy::Custom { url } = this.store.proxy.clone() {
             this.proxy_input
                 .update(cx, |input, cx| input.set_value(url, window, cx));
@@ -279,23 +374,17 @@ impl KiiChat {
         // be scrolled with the wheel (the popup layer swallows the event), so
         // selection happens in this app's searchable picker instead, and the
         // composer slot just shows what is selected.
-        let models: Vec<PromptModel> = self
-            .current_session()
-            .and_then(|session| session.model.clone())
-            .filter(|model| {
-                provider.is_some_and(|provider| provider.has_model(model))
-            })
+        let model = self.effective_model();
+        let models: Vec<PromptModel> = model
+            .clone()
+            .filter(|model| provider.is_some_and(|provider| provider.has_model(model)))
             .map(|model| {
                 vec![PromptModel::new(model.clone(), model.clone()).provider(
                     provider.map(|provider| provider.name.clone()).unwrap_or_default(),
                 )]
             })
             .unwrap_or_default();
-        let selected = self
-            .current_session()
-            .and_then(|session| session.model.clone())
-            .filter(|model| models.iter().any(|candidate| candidate.id() == model))
-            .or_else(|| models.first().map(|model| model.id().to_string()));
+        let selected = model.filter(|model| models.iter().any(|candidate| candidate.id() == model));
 
         self.prompt.update(cx, |prompt, cx| {
             prompt.set_models(models, cx);
@@ -303,6 +392,22 @@ impl KiiChat {
                 prompt.set_selected_model(model, cx);
             }
         });
+    }
+
+    /// The model a conversation will actually use: its own choice when the
+    /// current provider offers it, else the provider's first model.
+    ///
+    /// New conversations and provider switches both rely on this fallback, so
+    /// the composer's chip and the request path must read the same value.
+    fn effective_model(&self) -> Option<String> {
+        let provider = self
+            .current
+            .as_deref()
+            .and_then(|id| self.store.provider_for_session(id))?;
+        self.current_session()
+            .and_then(|session| session.model.clone())
+            .filter(|model| provider.has_model(model))
+            .or_else(|| provider.models.first().map(|model| model.id.clone()))
     }
 
     fn set_progress(&mut self, progress: ProgressState, cx: &mut Context<Self>) {
@@ -363,10 +468,7 @@ impl KiiChat {
             self.warn("还没有可用的供应商，请先打开「供应商设置」添加一个。", cx);
             return None;
         };
-        let model = self
-            .current_session()
-            .and_then(|session| session.model.clone())
-            .or_else(|| provider.models.first().map(|model| model.id.clone()));
+        let model = self.effective_model();
         let Some(model) = model else {
             self.warn(
                 format!("供应商「{}」还没有模型列表，请到设置里获取模型。", provider.name),
@@ -413,6 +515,7 @@ impl KiiChat {
     /// Re-runs the completion that failed, dropping it and everything after it.
     fn retry(&mut self, message_id: &str, cx: &mut Context<Self>) {
         if self.stream.is_some() {
+            self.warn("请等待当前回复结束，或先停止生成。", cx);
             return;
         }
         let Some((session_id, provider, model)) = self.target(cx) else {
@@ -438,6 +541,10 @@ impl KiiChat {
 
     /// Opens the in-place editor for a user message.
     fn begin_edit(&mut self, message_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.stream.is_some() {
+            self.warn("请等待当前回复结束，或先停止生成。", cx);
+            return;
+        }
         let Some(text) = self
             .current_session()
             .and_then(|session| session.messages.iter().find(|msg| msg.id == message_id))
@@ -463,19 +570,26 @@ impl KiiChat {
     /// Applies an edit and answers the edited turn again, dropping the replies
     /// that followed it — an edited prompt invalidates them.
     fn submit_edit(&mut self, cx: &mut Context<Self>) {
-        let Some(editing) = self.editing.take() else {
+        if self.stream.is_some() {
+            self.warn("请等待当前回复结束，或先停止生成。", cx);
+            return;
+        }
+        // Keep the editor open when the save cannot go through: closing it
+        // would throw away the draft the user just typed.
+        let Some(editing) = self.editing.as_ref() else {
             return;
         };
         let text = editing.editor.read(cx).value().trim().to_string();
+        let edited_id = editing.message_id.clone();
         if text.is_empty() {
             self.warn("消息内容不能为空。", cx);
-            cx.notify();
             return;
         }
         let Some((session_id, provider, model)) = self.target(cx) else {
             cx.notify();
             return;
         };
+        self.editing = None;
 
         let placeholder = Msg::new(Role::Assistant, "");
         let message_id = placeholder.id.clone();
@@ -486,12 +600,11 @@ impl KiiChat {
             let Some(index) = session
                 .messages
                 .iter()
-                .position(|msg| msg.id == editing.message_id)
+                .position(|msg| msg.id == edited_id)
             else {
                 return;
             };
             session.messages[index].content = text;
-            session.messages[index].error = None;
             session.messages[index].error = None;
             session.messages.truncate(index + 1);
             session.messages.push(placeholder);
@@ -504,6 +617,9 @@ impl KiiChat {
 
     /// Forks the conversation at a message into a new session.
     fn branch_from(&mut self, message_id: &str, cx: &mut Context<Self>) {
+        // A branch copies the transcript, so a live stream would be snapshotted
+        // as a half answer and then finish in a conversation nobody is looking at.
+        self.cancel_stream(cx);
         let Some(session_id) = self.current.clone() else {
             return;
         };
@@ -557,7 +673,10 @@ impl KiiChat {
         cx: &mut Context<Self>,
     ) {
         let cancel = Arc::new(AtomicBool::new(false));
+        self.stream_seq += 1;
+        let stream_id = self.stream_seq;
         self.stream = Some(Stream {
+            id: stream_id,
             session_id,
             message_id,
             cancel: cancel.clone(),
@@ -567,29 +686,44 @@ impl KiiChat {
         cx.notify();
 
         let max_tokens = provider.max_tokens_for(Some(&model));
-        let receiver = api::stream_chat(
-            provider.base_url.clone(),
-            provider.api_key_plain(),
-            provider.api,
+        let receiver = api::stream_chat(api::ChatRequest {
+            base_url: provider.base_url.clone(),
+            api_key: provider.api_key_plain(),
+            api: provider.api,
             model,
-            request,
+            messages: request,
             max_tokens,
-            self.store.proxy.clone(),
+            system_prompt: self.store.system_prompt.clone(),
+            temperature: self.store.temperature,
+            proxy: self.store.proxy.clone(),
             cancel,
-        );
+        });
         cx.spawn(async move |this, cx| {
-            while let Ok(event) = receiver.recv().await {
-                let terminal = matches!(event, StreamEvent::Done | StreamEvent::Error(_));
-                if this
-                    .update_in(cx, |this, window, cx| {
-                        this.apply_stream_event(event, window, cx)
-                    })
-                    .is_err()
-                {
-                    return;
-                }
-                if terminal {
-                    return;
+            loop {
+                match receiver.recv().await {
+                    Ok(event) => {
+                        let terminal = matches!(event, StreamEvent::Done | StreamEvent::Error(_));
+                        if this
+                            .update_in(cx, |this, window, cx| {
+                                this.apply_stream_event(stream_id, event, window, cx)
+                            })
+                            .is_err()
+                        {
+                            return;
+                        }
+                        if terminal {
+                            return;
+                        }
+                    }
+                    // The worker dropped its sender without a terminal event.
+                    // Close the reply out instead of leaving the composer
+                    // stuck in "running" forever.
+                    Err(_) => {
+                        let _ = this.update_in(cx, |this, window, cx| {
+                            this.finish_stream(stream_id, Some("连接已中断。".into()), window, cx)
+                        });
+                        return;
+                    }
                 }
             }
         })
@@ -598,13 +732,18 @@ impl KiiChat {
 
     fn apply_stream_event(
         &mut self,
+        stream_id: u64,
         event: StreamEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         // Content growth never yanks a reader who scrolled away from the tail;
         // `sync_transcript` follows only while the tail is in view.
-        let Some(stream) = self.stream.as_ref() else {
+        let Some(stream) = self
+            .stream
+            .as_ref()
+            .filter(|stream| stream.id == stream_id)
+        else {
             return;
         };
         let session_id = stream.session_id.clone();
@@ -628,8 +767,8 @@ impl KiiChat {
                     }
                 }
             }
-            StreamEvent::Done => self.finish_stream(None, window, cx),
-            StreamEvent::Error(error) => self.finish_stream(Some(error), window, cx),
+            StreamEvent::Done => self.finish_stream(stream_id, None, window, cx),
+            StreamEvent::Error(error) => self.finish_stream(stream_id, Some(error), window, cx),
         }
         self.sync_transcript(false);
         cx.notify();
@@ -637,24 +776,36 @@ impl KiiChat {
 
     fn finish_stream(
         &mut self,
+        stream_id: u64,
         error: Option<String>,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(stream) = self.stream.take() {
-            let row = self.row_of(&stream.session_id, &stream.message_id);
-            if let Some(message) = self.message_mut(&stream.session_id, &stream.message_id) {
-                match error {
-                    Some(error) => message.error = Some(error),
-                    None if message.content.is_empty() => {
-                        message.content = "（没有返回内容）".into()
-                    }
-                    None => {}
+        if !self
+            .stream
+            .as_ref()
+            .is_some_and(|stream| stream.id == stream_id)
+        {
+            return;
+        }
+        let Some(stream) = self.stream.take() else {
+            return;
+        };
+        let row = self.row_of(&stream.session_id, &stream.message_id);
+        if let Some(message) = self.message_mut(&stream.session_id, &stream.message_id) {
+            match error {
+                Some(error) => message.error = Some(error),
+                // An empty but "successful" reply is an interface error, not an
+                // answer: storing placeholder text would send it back as
+                // assistant context on the next turn.
+                None if message.content.is_empty() => {
+                    message.error = Some("接口没有返回内容。".into())
                 }
+                None => {}
             }
-            if let Some(row) = row {
-                self.transcript.remeasure_items(row..row + 1);
-            }
+        }
+        if let Some(row) = row {
+            self.transcript.remeasure_items(row..row + 1);
         }
         self.set_progress(ProgressState::Pending, cx);
         self.sync_transcript(false);
@@ -663,14 +814,23 @@ impl KiiChat {
     }
 
     fn cancel_stream(&mut self, cx: &mut Context<Self>) {
-        if let Some(stream) = self.stream.as_ref() {
-            stream.cancel.store(true, Ordering::Relaxed);
+        let Some(stream) = self.stream.take() else {
+            return;
+        };
+        stream.cancel.store(true, Ordering::Relaxed);
+        // Keep the partial answer as context and mark it, rather than deleting
+        // what the user already read.
+        let row = self.row_of(&stream.session_id, &stream.message_id);
+        if let Some(message) = self.message_mut(&stream.session_id, &stream.message_id) {
+            message.stopped = true;
         }
-        if self.stream.take().is_some() {
-            self.set_progress(ProgressState::Pending, cx);
-            self.persist(cx);
-            cx.notify();
+        if let Some(row) = row {
+            self.transcript.remeasure_items(row..row + 1);
         }
+        self.set_progress(ProgressState::Pending, cx);
+        self.sync_transcript(false);
+        self.persist(cx);
+        cx.notify();
     }
 
     /// Index of a message in a conversation, for list invalidation.
@@ -693,11 +853,17 @@ impl KiiChat {
     // -------------------------------------------------------------- sessions
 
     fn new_session(&mut self, cx: &mut Context<Self>) {
+        // One stream at a time: leaving a reply running in a hidden
+        // conversation would freeze the composer of the new one.
+        self.cancel_stream(cx);
         let session = Session::new();
         let id = session.id.clone();
         self.store.sessions.insert(0, session);
         self.current = Some(id);
         self.page = Page::Chat;
+        self.picker_open = false;
+        self.confirm = None;
+        self.renaming = None;
         self.sync_transcript(true);
         self.sync_prompt(cx);
         self.persist(cx);
@@ -711,20 +877,125 @@ impl KiiChat {
         self.cancel_stream(cx);
         self.current = Some(id.to_string());
         self.page = Page::Chat;
+        self.renaming = None;
+        self.confirm = None;
         self.sync_transcript(true);
         self.sync_prompt(cx);
         cx.notify();
     }
 
+    /// Asks before deleting a conversation; the second click commits.
+    fn request_delete_session(&mut self, id: &str, cx: &mut Context<Self>) {
+        let Some(title) = self.store.session(id).map(|session| session.title.clone()) else {
+            return;
+        };
+        self.confirm = Some(Confirm::Session {
+            id: id.to_string(),
+            title,
+        });
+        cx.notify();
+    }
+
+    /// Commits whatever destructive action is pending, on the second click.
+    fn confirm_pending(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(confirm) = self.confirm.take() else {
+            return;
+        };
+        match confirm {
+            Confirm::Session { id, .. } => self.delete_session(&id, cx),
+            Confirm::Provider { id, .. } => self.delete_provider(&id, window, cx),
+        }
+    }
+
+    fn dismiss_confirm(&mut self, cx: &mut Context<Self>) {
+        if self.confirm.take().is_some() {
+            cx.notify();
+        }
+    }
+
     fn delete_session(&mut self, id: &str, cx: &mut Context<Self>) {
-        self.cancel_stream(cx);
+        // Only the deleted conversation's reply is abandoned; another
+        // conversation may legitimately still be streaming.
+        if self
+            .stream
+            .as_ref()
+            .is_some_and(|stream| stream.session_id == id)
+        {
+            self.cancel_stream(cx);
+        }
         self.store.sessions.retain(|session| session.id != id);
+        if self.renaming.as_deref() == Some(id) {
+            self.renaming = None;
+        }
         if self.current.as_deref() == Some(id) {
             self.current = None;
             self.open(cx);
         }
         self.persist(cx);
         cx.notify();
+    }
+
+    /// Opens the inline title editor for a conversation.
+    fn begin_rename(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(title) = self.store.session(id).map(|session| session.title.clone()) else {
+            return;
+        };
+        self.rename_input.update(cx, |input, cx| {
+            input.set_value(title, window, cx);
+            input.focus(window, cx);
+        });
+        self.renaming = Some(id.to_string());
+        self.confirm = None;
+        cx.notify();
+    }
+
+    fn submit_rename(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.renaming.clone() else {
+            return;
+        };
+        let title = self.rename_input.read(cx).value().trim().to_string();
+        if title.is_empty() {
+            self.warn("会话名称不能为空。", cx);
+            return;
+        }
+        if let Some(session) = self.store.session_mut(&id) {
+            session.title = title;
+        }
+        self.renaming = None;
+        self.persist(cx);
+        cx.notify();
+    }
+
+    fn cancel_rename(&mut self, cx: &mut Context<Self>) {
+        if self.renaming.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Conversations matching the sidebar search box, as `(id, title)`.
+    ///
+    /// Cloning titles only keeps rendering cheap: no message bodies cross this
+    /// boundary just to draw a sidebar row.
+    fn visible_sessions(&self, cx: &App) -> Vec<(String, String)> {
+        // The box is only rendered once the list is long; keep filtering and
+        // rendering in step so a leftover query cannot hide rows with no way
+        // to clear it.
+        let searching = self.store.sessions.len() >= 4;
+        let query = if searching {
+            self.session_search.read(cx).value().trim().to_lowercase()
+        } else {
+            String::new()
+        };
+        self.store
+            .sessions
+            .iter()
+            .filter(|session| {
+                query.is_empty()
+                    || self.current.as_deref() == Some(session.id.as_str())
+                    || session.title.to_lowercase().contains(&query)
+            })
+            .map(|session| (session.id.clone(), session.title.clone()))
+            .collect()
     }
 
     // ---------------------------------------------------------------- proxy
@@ -752,6 +1023,32 @@ impl KiiChat {
         self.store.proxy = Proxy::Custom { url };
         self.notice = None;
         self.persist(cx);
+        cx.notify();
+    }
+
+    // ----------------------------------------------------------- chat params
+
+    /// Saves the global system prompt and sampling temperature.
+    fn save_chat_params(&mut self, cx: &mut Context<Self>) {
+        let system_prompt = self.system_input.read(cx).value().trim().to_string();
+        let raw_temperature = self.temperature_input.read(cx).value().trim().to_string();
+        let temperature = if raw_temperature.is_empty() {
+            None
+        } else {
+            match raw_temperature.parse::<f64>() {
+                Ok(value) if (0.0..=2.0).contains(&value) => Some(value),
+                _ => {
+                    self.params_status =
+                        "温度需为 0 到 2 之间的数字；留空表示使用接口默认值。".into();
+                    cx.notify();
+                    return;
+                }
+            }
+        };
+        self.store.system_prompt = system_prompt;
+        self.store.temperature = temperature;
+        self.persist(cx);
+        self.params_status = "已保存，下次发送即生效。".into();
         cx.notify();
     }
 
@@ -910,6 +1207,18 @@ impl KiiChat {
         cx.notify();
     }
 
+    /// Asks before deleting a provider; the second click commits.
+    fn request_delete_provider(&mut self, id: &str, cx: &mut Context<Self>) {
+        let Some(name) = self.store.provider(id).map(|provider| provider.name.clone()) else {
+            return;
+        };
+        self.confirm = Some(Confirm::Provider {
+            id: id.to_string(),
+            name,
+        });
+        cx.notify();
+    }
+
     fn select_provider(&mut self, id: &str, cx: &mut Context<Self>) {
         self.store.selected_provider = Some(id.to_string());
         self.persist(cx);
@@ -1049,6 +1358,49 @@ impl KiiChat {
     }
 
     // ---------------------------------------------------------------- render
+
+    /// The confirmation bar for a pending deletion, if one is waiting.
+    ///
+    /// Deleting a conversation or a provider is irreversible, so the first
+    /// click only arms the action; this bar is the second click's home.
+    pub(super) fn render_confirm_bar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let theme = cx.theme();
+        let text = match self.confirm.as_ref()? {
+            Confirm::Session { title, .. } => {
+                format!("删除会话「{title}」？其中的消息会一并删除，且无法恢复。")
+            }
+            Confirm::Provider { name, .. } => {
+                format!("删除供应商「{name}」？API Key 与模型列表会一并删除。")
+            }
+        };
+        Some(
+            h_flex()
+                .flex_none()
+                .items_center()
+                .gap_2()
+                .px_4()
+                .py_2()
+                .bg(theme.secondary)
+                .border_b_1()
+                .border_color(theme.border)
+                .text_color(theme.secondary_foreground)
+                .child(div().flex_1().min_w_0().text_sm().child(text))
+                .child(
+                    Button::new("confirm-delete")
+                        .label("删除")
+                        .danger()
+                        .small()
+                        .on_click(cx.listener(|this, _, window, cx| this.confirm_pending(window, cx))),
+                )
+                .child(
+                    Button::new("cancel-delete")
+                        .label("取消")
+                        .small()
+                        .on_click(cx.listener(|this, _, _, cx| this.dismiss_confirm(cx))),
+                )
+                .into_any_element(),
+        )
+    }
 }
 
 impl Render for KiiChat {
@@ -1058,6 +1410,7 @@ impl Render for KiiChat {
         let collapsed = self.store.sidebar_collapsed;
         let title_bar = self.render_title_bar(window, dark, cx);
         let sidebar = self.render_sidebar(cx);
+        let confirm_bar = self.render_confirm_bar(cx);
         let page = match self.page {
             Page::Chat => self.render_chat(cx),
             Page::Settings => self.render_settings(cx),
@@ -1074,7 +1427,14 @@ impl Render for KiiChat {
                     .min_h_0()
                     .min_w_0()
                     .when(!collapsed, |this| this.child(sidebar))
-                    .child(div().flex_1().min_w_0().h_full().child(page)),
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .when_some(confirm_bar, |this, bar| this.child(bar))
+                            .child(div().flex_1().min_h_0().child(page)),
+                    ),
             )
     }
 }

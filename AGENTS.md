@@ -35,7 +35,7 @@ Rules:
 - `gpui-ai`'s `Chat` was dropped because its message row is fixed: it always
   renders a role heading, and its action row only offers
   copy/regenerate/edit/feedback with icons. This app needs no role headings,
-  text actions (复制 / 分支 / 重试), a red 失败重试 state, and a branch action —
+  text actions (复制 / 分支 / 重试), a red 重试 state, and a branch action —
   none of which the component exposes. The transcript is therefore built here.
 
 ## Layout
@@ -78,6 +78,29 @@ scripts/              dev tooling: fake provider server + UI Automation / captur
   body, the auth scheme (`Bearer` vs `x-api-key` + `anthropic-version`) and the
   delta extraction per shape. The serde names are written out per variant —
   `rename_all = "kebab-case"` would have produced `open-ai-completions`.
+- **One pure request builder covers all three shapes.** `api::build_request`
+  maps the same conversation onto each shape: `max_tokens` for Chat
+  Completions (`max_completion_tokens` for OpenAI reasoning families),
+  `max_output_tokens` for Responses, the configured system prompt as a leading
+  `system` message / top-level `instructions` / top-level `system`, and
+  `temperature` only when set (clamped to 1.0 for Messages). `api.rs` tests
+  pin every field and the surviving user turn; a silently dropped system prompt
+  or output budget is a bug, not a vendor quirk.
+- **A completion carries a monotonic id.** `Stream.id` is compared before every
+  event is applied: cancelling and immediately resending must not let the old
+  worker's deltas land in the new reply. Cancelling keeps the partial answer,
+  marks `Msg.stopped`, and renders「已停止生成」; a stream with no response
+  headers or body chunk for 120 s fails instead of leaving the composer stuck
+  in "running". One stream at a time is global: switching, creating, branching
+  and deleting the streaming conversation cancel it.
+- **Chat parameters are global, for now.** `Store.system_prompt` and
+  `Store.temperature` are edited in the settings `对话` section and read when a
+  completion launches. Per-conversation prompts would need a session field and
+  a different settings surface.
+- **Destructive actions take two clicks.** `Confirm` (session or provider) is
+  armed by the trash icon and committed from the bar rendered above the page.
+  Deleting a conversation also cancels its stream, drops a rename in progress,
+  and creates a fresh conversation when the store empties.
 - **A config the app cannot read is moved aside, never ignored.** `Store::load`
   returns the store plus a warning; on a parse error the file becomes
   `config.json.invalid` and the UI explains it. Starting empty and then saving
@@ -94,12 +117,14 @@ scripts/              dev tooling: fake provider server + UI Automation / captur
   silent fallback.
 - **Errors surface in the UI.** A failed reply is stored in `Msg.error`, shown
   inside the bubble with a red border, and its retry action becomes a red
-  "失败重试" text button.
+  「重试」 text button.
 - **Palette overrides must be re-applied after every theme change.**
   `Theme::change` re-applies the active theme JSON, wiping color edits, so
   `apply_theme` changes the mode first, then writes the palette into
-  `Theme::global_mut(cx).colors`, then `Theme::sync_base` + `window.refresh`.
-  Token order in `colors_of` and both palette arrays must stay in step.
+  `Theme::global_mut(cx).colors`, then rebuilds the cached `Theme::tokens`
+  snapshot (buttons read `tokens.button_primary`, not `colors.primary`, or they
+  stay upstream-black), then `Theme::sync_base` + `window.refresh`. Token order
+  in `colors_of` and both palette arrays must stay in step.
 - **Two icons are embedded by this app.** The bundled component icon set is a
   curated 101-glyph subset with no branch and no pencil, so `src/icons.rs`
   wraps `gpui_component_assets::Assets` and serves `icons/kiichat-*.svg` from
@@ -108,9 +133,9 @@ scripts/              dev tooling: fake provider server + UI Automation / captur
   `Icon::empty().path(icons::GIT_FORK_PATH)`; `gpui_component::IconName` only
   carries the curated set.
 - **Actions are icon-only square buttons** (`复制` / `分支` / `重试`, plus `编辑`
-  on user messages). Every icon-only control carries `.tooltip(...)` and
-  `.accessibility_label(...)`, which is also how the verification scripts find
-  it. A failed reply's retry grows a red `重试` label.
+  on user messages and `重命名会话` in the sidebar). Every icon-only control
+  carries `.tooltip(...)` and `.accessibility_label(...)`, which is also how the
+  verification scripts find it. A failed reply's retry grows a red `重试` label.
 - **Editing a user message re-sends it.** Saving the inline editor rewrites the
   message, drops every reply after it, and launches a fresh completion.
 - **Client-side decorations.** The window is created from
@@ -202,10 +227,14 @@ compile proves nothing about layout.
    ```
 
    `scripts/mock_openai.py` serves all three shapes and asserts each request's
-   shape (Bearer + `messages`, Bearer + `input`, `x-api-key` + `max_tokens`), so
-   a reply that arrives proves the request was built for that API. Point a
-   provider at `http://127.0.0.1:18080/v1`, then check the server log and
-   `%APPDATA%\KiiChat\config.json` for the persisted streamed answer.
+   shape and budget field (Bearer + `messages` + `max_tokens`, Bearer + `input` +
+   `max_output_tokens` and no `max_tokens`, `x-api-key` + `max_tokens`), so a
+   reply that arrives proves the request was built for that API. It logs
+   `system`, `temperature` and both budget fields. `MOCK_SLOW=1` stretches the
+   completions stream to ~10 s so the stop button can be driven through UI
+   Automation. Point a provider at `http://127.0.0.1:18080/v1`, then check the
+   server log and `%APPDATA%\KiiChat\config.json` for the persisted streamed
+   answer.
 
 6. **Verify visually without eyes.** Capture, then measure:
 
@@ -239,7 +268,7 @@ Hard rules for verification:
 - The Linux job installs GPUI's windowing dependencies; if upstream changes its
   feature set, that list is the first thing to revisit.
 
-## Open items (2026-09-12)
+## Open items (2026-10-24)
 
 Only what has been observed, with the evidence that showed it:
 
@@ -262,6 +291,39 @@ Only what has been observed, with the evidence that showed it:
 6. **Reasoning strip is unverified against a live reasoning model.** The wire
    parsers and UI exist; DeepSeek-reasoner / Claude thinking have not been
    driven end-to-end on this machine.
+7. **The Chat Completions budget field is inferred from the model id.** Names
+   starting `o1` / `o3` / `o4` / `gpt-5` get `max_completion_tokens`; everything
+   else gets `max_tokens`. A vendor whose custom id needs the other field would
+   need an explicit override. The mock only models the `max_tokens` path.
+8. **System prompt and temperature are global.** Per-conversation overrides are
+   a product decision not yet taken; both fields live in `Store`, not `Session`.
+
+### Closed this session (2026-10-24)
+
+- Settings `对话`: global system prompt + temperature, saved explicitly and
+  carried by all three API shapes (`system` message, `instructions`, top-level
+  `system`); Anthropic temperature clamps to 1.0.
+- Output budget now reaches the wire for Chat Completions and Responses too
+  (`max_tokens` / `max_output_tokens`; reasoning families switch to
+  `max_completion_tokens`).
+- Stop generation keeps the partial answer, sets `Msg.stopped`, shows
+  「已停止生成」; a monotonic stream id drops late events from a cancelled
+  worker; header wait and body chunks share the 120 s idle timeout.
+- Session UX: inline rename, title search at ≥4 conversations, two-step delete
+  for sessions and providers. Nested row actions stop click propagation, so
+  UIA invocation no longer just selects the row.
+- New conversations and provider switches show the effective fallback model
+  instead of 「未选择模型」; sending no longer carries a foreign provider's
+  model id.
+- Empty successful replies become a red error with retry instead of placeholder
+  assistant text being sent back as context.
+- Editing and retry are refused with a notice while a reply is streaming.
+- Filled primary buttons now use the app's accent blue: `apply_theme` rebuilds
+  the cached `Theme.tokens` snapshot after writing the palette (the upstream
+  theme cache kept `button_primary` black regardless of `colors.primary`).
+- `cargo test`: 25 unit tests covering the three request shapes, system merge,
+  deltas, SSE blocks, palette completeness, config compatibility and at-rest
+  key encoding.
 
 ### Closed this session (2026-09-12)
 
@@ -289,6 +351,11 @@ Only what has been observed, with the evidence that showed it:
 - A seeded config must be checked against `src/store.rs`'s field names; a
   config the app cannot parse used to start it empty (now it is moved to
   `config.json.invalid` with a notice).
+- **UIA invocation and a real click are not the same path.** Measured on
+  2026-10-24: `InvokePattern` on the trash button inside a clickable session row
+  ran the row's `select_session` handler after the action and cleared the
+  confirm bar, while a real click at the same rect worked. Row-nested action
+  listeners call `cx.stop_propagation()`; verify both paths, not just one.
 
 ## Repository hygiene
 

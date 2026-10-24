@@ -40,9 +40,13 @@ pub fn normalize_base(raw: &str) -> String {
 }
 
 /// The conversation in Chat Completions shape.
+///
+/// System turns are lifted out by [`system_text`] and re-inserted once as the
+/// leading message, so they must not appear here a second time.
 fn chat_messages(messages: &[(Role, String)]) -> Vec<serde_json::Value> {
     messages
         .iter()
+        .filter(|(role, _)| *role != Role::System)
         .map(|(role, content)| {
             serde_json::json!({
                 "role": role.wire(),
@@ -86,13 +90,128 @@ fn anthropic_messages(messages: &[(Role, String)]) -> Vec<serde_json::Value> {
         .collect()
 }
 
-fn system_prompt(messages: &[(Role, String)]) -> String {
-    messages
-        .iter()
-        .filter(|(role, _)| *role == Role::System)
-        .map(|(_, content)| content.clone())
-        .collect::<Vec<_>>()
-        .join("\n\n")
+fn system_text(system_prompt: &str, messages: &[(Role, String)]) -> String {
+    let mut parts = Vec::new();
+    let configured = system_prompt.trim();
+    if !configured.is_empty() {
+        parts.push(configured.to_string());
+    }
+    parts.extend(
+        messages
+            .iter()
+            .filter(|(role, _)| *role == Role::System)
+            .map(|(_, content)| content.clone()),
+    );
+    parts.join("\n\n")
+}
+
+/// The budget field Chat Completions understands for a model.
+///
+/// OpenAI's reasoning lines (`o1` / `o3` / `o4` / `gpt-5`) reject `max_tokens`
+/// and require `max_completion_tokens`; the wider compatible ecosystem still
+/// uses `max_tokens`, so only those families are switched.
+fn completion_budget_field(model: &str) -> &'static str {
+    let id = model.rsplit('/').next().unwrap_or(model).to_ascii_lowercase();
+    let reasoning = ["o1", "o3", "o4", "gpt-5"].iter().any(|family| {
+        id == *family || id.starts_with(&format!("{family}-")) || id.starts_with(&format!("{family}."))
+    });
+    if reasoning {
+        "max_completion_tokens"
+    } else {
+        "max_tokens"
+    }
+}
+
+/// Builds the URL and JSON body of one chat request.
+///
+/// Kept pure so the three request shapes can be pinned by tests: the fields a
+/// vendor accepts (`max_tokens` vs `max_output_tokens`, a `system` message vs
+/// the Responses `instructions`, the Anthropic top-level `system`) differ, and
+/// a silently dropped system prompt is hard to notice at runtime.
+fn build_request(
+    api: ApiFormat,
+    base_url: &str,
+    model: &str,
+    messages: &[(Role, String)],
+    max_tokens: u32,
+    system_prompt: &str,
+    temperature: Option<f64>,
+) -> (String, serde_json::Value) {
+    let base = normalize_base(base_url);
+    let system = system_text(system_prompt, messages);
+    let (url, mut body) = match api {
+        ApiFormat::OpenAiCompletions => {
+            let mut conversation = Vec::with_capacity(messages.len() + 1);
+            if !system.is_empty() {
+                conversation.push(serde_json::json!({
+                    "role": Role::System.wire(),
+                    "content": system,
+                }));
+            }
+            conversation.extend(chat_messages(messages));
+            let mut body = serde_json::json!({
+                "model": model,
+                "stream": true,
+                "messages": conversation,
+            });
+            body[completion_budget_field(model)] = serde_json::json!(max_tokens);
+            (format!("{base}/chat/completions"), body)
+        }
+        ApiFormat::OpenAiResponses => {
+            let mut body = serde_json::json!({
+                "model": model,
+                "stream": true,
+                // Responses names the completion budget differently and takes
+                // the system prompt as a top-level instruction.
+                "max_output_tokens": max_tokens,
+                "input": responses_input(messages),
+            });
+            if !system.is_empty() {
+                body["instructions"] = serde_json::Value::String(system);
+            }
+            (format!("{base}/responses"), body)
+        }
+        ApiFormat::AnthropicMessages => {
+            let mut body = serde_json::json!({
+                "model": model,
+                "stream": true,
+                // The Messages API has no `system` role in `messages` and
+                // requires a token budget.
+                "max_tokens": max_tokens,
+                "messages": anthropic_messages(messages),
+            });
+            if !system.is_empty() {
+                body["system"] = serde_json::Value::String(system);
+            }
+            (format!("{base}/messages"), body)
+        }
+    };
+    if let Some(temperature) = temperature {
+        // The Messages API accepts 0–1 only; the settings field allows 0–2 for
+        // OpenAI-compatible endpoints, so clamp per shape rather than fail.
+        let temperature = match api {
+            ApiFormat::AnthropicMessages => temperature.clamp(0.0, 1.0),
+            _ => temperature,
+        };
+        body["temperature"] = serde_json::json!(temperature);
+    }
+    (url, body)
+}
+
+/// Everything one streaming completion needs.
+pub struct ChatRequest {
+    pub base_url: String,
+    pub api_key: String,
+    pub api: ApiFormat,
+    pub model: String,
+    pub messages: Vec<(Role, String)>,
+    pub max_tokens: u32,
+    /// Global prompt, placed ahead of the conversation in each API's own way.
+    pub system_prompt: String,
+    /// `None` leaves the provider's default sampling temperature.
+    pub temperature: Option<f64>,
+    pub proxy: Proxy,
+    pub cancel: Arc<AtomicBool>,
 }
 
 /// The text a stream delta carries, per API shape.
@@ -316,18 +435,36 @@ fn first_u32(value: &serde_json::Value, keys: &[&str]) -> Option<u32> {
         .map(|v| v as u32)
 }
 
+/// How long a streaming response may stay silent before it is treated as dead.
+///
+/// Without this a stalled connection leaves the reply "streaming" forever:
+/// the request has no total timeout because a long answer is legitimate.
+const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// The `data:` payloads of one SSE event block.
+fn sse_data(event: &str) -> Vec<&str> {
+    event
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .map(str::trim)
+        .filter(|data| !data.is_empty())
+        .collect()
+}
+
 /// Starts a streaming chat completion. Set `cancel` to stop early.
-#[allow(clippy::too_many_arguments)]
-pub fn stream_chat(
-    base_url: String,
-    api_key: String,
-    api: ApiFormat,
-    model: String,
-    messages: Vec<(Role, String)>,
-    max_tokens: u32,
-    proxy: Proxy,
-    cancel: Arc<AtomicBool>,
-) -> async_channel::Receiver<StreamEvent> {
+pub fn stream_chat(request: ChatRequest) -> async_channel::Receiver<StreamEvent> {
+    let ChatRequest {
+        base_url,
+        api_key,
+        api,
+        model,
+        messages,
+        max_tokens,
+        system_prompt,
+        temperature,
+        proxy,
+        cancel,
+    } = request;
     let (tx, rx) = async_channel::unbounded();
     std::thread::spawn(move || {
         let runtime = match tokio::runtime::Builder::new_current_thread()
@@ -357,41 +494,22 @@ pub fn stream_chat(
                     return;
                 }
             };
-            let base = normalize_base(&base_url);
-            let (url, body) = match api {
-                ApiFormat::OpenAiCompletions => (
-                    format!("{base}/chat/completions"),
-                    serde_json::json!({
-                        "model": model,
-                        "stream": true,
-                        "messages": chat_messages(&messages),
-                    }),
-                ),
-                ApiFormat::OpenAiResponses => (
-                    format!("{base}/responses"),
-                    serde_json::json!({
-                        "model": model,
-                        "stream": true,
-                        "input": responses_input(&messages),
-                    }),
-                ),
-                ApiFormat::AnthropicMessages => (
-                    format!("{base}/messages"),
-                    serde_json::json!({
-                        "model": model,
-                        "stream": true,
-                        // The Messages API has no `system` role in `messages`
-                        // and requires a token budget.
-                        "max_tokens": max_tokens,
-                        "system": system_prompt(&messages),
-                        "messages": anthropic_messages(&messages),
-                    }),
-                ),
-            };
+            let (url, body) = build_request(
+                api,
+                &base_url,
+                &model,
+                &messages,
+                max_tokens,
+                &system_prompt,
+                temperature,
+            );
             let request = authorize(client.post(&url).json(&body), api, &api_key);
-            let response = match request.send().await {
-                Ok(response) => response,
-                Err(err) => {
+            // Waiting for response headers is part of "the stream is silent":
+            // a server that accepts the socket and never answers must not keep
+            // the composer running forever.
+            let response = match tokio::time::timeout(STREAM_IDLE_TIMEOUT, request.send()).await {
+                Ok(Ok(response)) => response,
+                Ok(Err(err)) => {
                     send(StreamEvent::Error(format!(
                         "请求 {url} 失败: {}",
                         describe(&err)
@@ -399,10 +517,24 @@ pub fn stream_chat(
                     .await;
                     return;
                 }
+                Err(_) => {
+                    send(StreamEvent::Error(format!(
+                        "连接超时：{} 秒内没有收到响应。",
+                        STREAM_IDLE_TIMEOUT.as_secs()
+                    )))
+                    .await;
+                    return;
+                }
             };
             let status = response.status();
             if !status.is_success() {
-                let detail = response.text().await.unwrap_or_default();
+                // An error body is small, but a broken server can stall here
+                // too; don't let it outlive the same budget.
+                let detail = match tokio::time::timeout(Duration::from_secs(10), response.text()).await
+                {
+                    Ok(Ok(detail)) => detail,
+                    _ => String::new(),
+                };
                 send(StreamEvent::Error(format!(
                     "HTTP {status}: {}",
                     truncate(&detail, 300)
@@ -413,10 +545,22 @@ pub fn stream_chat(
 
             let mut stream = Box::pin(response.bytes_stream());
             let mut buffer = String::new();
-            while let Some(chunk) = stream.next().await {
+            loop {
                 if cancel.load(Ordering::Relaxed) {
                     return;
                 }
+                let next = match tokio::time::timeout(STREAM_IDLE_TIMEOUT, stream.next()).await {
+                    Ok(next) => next,
+                    Err(_) => {
+                        send(StreamEvent::Error(format!(
+                            "连接超时：{} 秒没有收到新数据。",
+                            STREAM_IDLE_TIMEOUT.as_secs()
+                        )))
+                        .await;
+                        return;
+                    }
+                };
+                let Some(chunk) = next else { break };
                 let chunk = match chunk {
                     Ok(chunk) => chunk,
                     Err(err) => {
@@ -428,14 +572,7 @@ pub fn stream_chat(
 
                 while let Some(index) = buffer.find("\n\n") {
                     let event: String = buffer.drain(..index + 2).collect();
-                    for line in event.lines() {
-                        let Some(data) = line.strip_prefix("data:") else {
-                            continue;
-                        };
-                        let data = data.trim();
-                        if data.is_empty() {
-                            continue;
-                        }
+                    for data in sse_data(&event) {
                         if data == "[DONE]" {
                             send(StreamEvent::Done).await;
                             return;
@@ -470,4 +607,251 @@ pub fn stream_chat(
         });
     });
     rx
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn body_for(api: ApiFormat, system_prompt: &str, temperature: Option<f64>) -> serde_json::Value {
+        let messages = vec![(Role::User, "你好".to_string())];
+        let (_, body) = build_request(
+            api,
+            "http://127.0.0.1:18080",
+            "mock-mini",
+            &messages,
+            4096,
+            system_prompt,
+            temperature,
+        );
+        body
+    }
+
+    #[test]
+    fn base_url_gets_v1_only_when_bare() {
+        assert_eq!(
+            normalize_base("https://api.deepseek.com"),
+            "https://api.deepseek.com/v1"
+        );
+        assert_eq!(
+            normalize_base("https://api.deepseek.com/"),
+            "https://api.deepseek.com/v1"
+        );
+        assert_eq!(
+            normalize_base("http://127.0.0.1:18080/v1/"),
+            "http://127.0.0.1:18080/v1"
+        );
+        assert_eq!(
+            normalize_base(" http://host/openai/v1 "),
+            "http://host/openai/v1"
+        );
+    }
+
+    /// The documented output budget must actually reach the wire. It used to be
+    /// computed for every provider and then only sent to Anthropic.
+    #[test]
+    fn chat_completions_body_carries_system_budget_and_temperature() {
+        let body = body_for(ApiFormat::OpenAiCompletions, "简短回答。", Some(0.2));
+        assert_eq!(body["model"], "mock-mini");
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["max_tokens"], 4096);
+        assert_eq!(body["temperature"], 0.2);
+        assert_eq!(body["messages"][0]["role"], "system");
+        assert_eq!(body["messages"][0]["content"], "简短回答。");
+        assert_eq!(body["messages"][1]["role"], "user");
+        assert_eq!(body["messages"][1]["content"], "你好");
+    }
+
+    #[test]
+    fn openai_reasoning_models_use_max_completion_tokens() {
+        let messages = vec![(Role::User, "你好".to_string())];
+        let (_, body) = build_request(
+            ApiFormat::OpenAiCompletions,
+            "http://host/v1",
+            "o3-mini",
+            &messages,
+            1024,
+            "",
+            None,
+        );
+        assert_eq!(body["max_completion_tokens"], 1024);
+        assert!(body.get("max_tokens").is_none(), "{body}");
+    }
+
+    #[test]
+    fn responses_body_uses_instructions_and_output_budget() {
+        let body = body_for(ApiFormat::OpenAiResponses, "简短回答。", Some(0.2));
+        assert_eq!(body["model"], "mock-mini");
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["max_output_tokens"], 4096);
+        assert_eq!(body["instructions"], "简短回答。");
+        assert_eq!(body["temperature"], 0.2);
+        assert!(body.get("max_tokens").is_none());
+        let input = body["input"].as_array().expect("input array");
+        assert!(input.iter().all(|item| item["role"] != "system"));
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[0]["content"][0]["text"], "你好");
+    }
+
+    #[test]
+    fn anthropic_body_lifts_system_out_of_messages() {
+        let body = body_for(ApiFormat::AnthropicMessages, "简短回答。", Some(0.2));
+        assert_eq!(body["model"], "mock-mini");
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["system"], "简短回答。");
+        assert_eq!(body["max_tokens"], 4096);
+        assert_eq!(body["temperature"], 0.2);
+        let messages = body["messages"].as_array().expect("messages array");
+        assert!(messages.iter().all(|item| item["role"] != "system"));
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"], "你好");
+    }
+
+    /// The Messages API accepts 0–1 only; the settings field allows 0–2 for the
+    /// other shapes, so the wire value must be clamped, not rejected.
+    #[test]
+    fn anthropic_temperature_is_clamped_to_one() {
+        let body = body_for(ApiFormat::AnthropicMessages, "", Some(1.7));
+        assert_eq!(body["temperature"], 1.0);
+        let body = body_for(ApiFormat::OpenAiCompletions, "", Some(1.7));
+        assert_eq!(body["temperature"], 1.7);
+    }
+
+    /// An unset system prompt or temperature must produce no field at all, not
+    /// an empty string or a zero temperature that would change the sampling.
+    #[test]
+    fn empty_system_prompt_and_no_temperature_stay_absent() {
+        for api in ApiFormat::ALL {
+            let body = body_for(api, "  \n ", None);
+            assert!(body.get("temperature").is_none(), "{api:?}");
+            assert!(body.get("instructions").is_none(), "{api:?}");
+            assert!(body.get("system").is_none(), "{api:?}");
+            if let Some(messages) = body.get("messages").and_then(|value| value.as_array()) {
+                assert!(
+                    messages.iter().all(|message| message["role"] != "system"),
+                    "{api:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn system_messages_are_merged_once_ahead_of_the_conversation() {
+        let messages = vec![
+            (Role::System, "旧设定".to_string()),
+            (Role::User, "你好".to_string()),
+        ];
+        for api in ApiFormat::ALL {
+            let (_, body) = build_request(
+                api,
+                "http://host/v1",
+                "mock-mini",
+                &messages,
+                4096,
+                "新设定",
+                None,
+            );
+            let merged = "新设定\n\n旧设定";
+            match api {
+                ApiFormat::OpenAiCompletions => {
+                    let messages = body["messages"].as_array().expect("messages array");
+                    assert_eq!(
+                        messages
+                            .iter()
+                            .filter(|message| message["role"] == "system")
+                            .count(),
+                        1,
+                        "{body}"
+                    );
+                    assert_eq!(messages[0]["content"], merged);
+                    assert_eq!(messages[1]["role"], "user");
+                }
+                ApiFormat::OpenAiResponses => {
+                    assert_eq!(body["instructions"], merged, "{body}");
+                    assert_eq!(body["input"][0]["role"], "user");
+                }
+                ApiFormat::AnthropicMessages => {
+                    assert_eq!(body["system"], merged, "{body}");
+                    assert_eq!(body["messages"][0]["role"], "user");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn completion_deltas_carry_content_and_reasoning() {
+        let value = serde_json::json!({
+            "choices": [{ "delta": { "content": "答", "reasoning_content": "想" } }]
+        });
+        assert_eq!(
+            delta_text(ApiFormat::OpenAiCompletions, &value).as_deref(),
+            Some("答")
+        );
+        assert_eq!(
+            thinking_text(ApiFormat::OpenAiCompletions, &value).as_deref(),
+            Some("想")
+        );
+    }
+
+    #[test]
+    fn responses_deltas_are_typed_events() {
+        let content = serde_json::json!({
+            "type": "response.output_text.delta", "delta": "答"
+        });
+        let thinking = serde_json::json!({
+            "type": "response.reasoning_summary_text.delta", "delta": "想"
+        });
+        assert_eq!(
+            delta_text(ApiFormat::OpenAiResponses, &content).as_deref(),
+            Some("答")
+        );
+        assert_eq!(
+            thinking_text(ApiFormat::OpenAiResponses, &thinking).as_deref(),
+            Some("想")
+        );
+    }
+
+    #[test]
+    fn anthropic_deltas_separate_text_from_thinking() {
+        let text = serde_json::json!({
+            "type": "content_block_delta",
+            "delta": { "type": "text_delta", "text": "答" }
+        });
+        let thinking = serde_json::json!({
+            "type": "content_block_delta",
+            "delta": { "type": "thinking_delta", "thinking": "想" }
+        });
+        assert_eq!(
+            delta_text(ApiFormat::AnthropicMessages, &text).as_deref(),
+            Some("答")
+        );
+        assert!(thinking_text(ApiFormat::AnthropicMessages, &text).is_none());
+        assert_eq!(
+            thinking_text(ApiFormat::AnthropicMessages, &thinking).as_deref(),
+            Some("想")
+        );
+    }
+
+    #[test]
+    fn stream_end_events_are_shape_specific() {
+        assert!(!is_final_event(
+            ApiFormat::OpenAiCompletions,
+            &serde_json::json!({ "choices": [] })
+        ));
+        assert!(is_final_event(
+            ApiFormat::OpenAiResponses,
+            &serde_json::json!({ "type": "response.completed" })
+        ));
+        assert!(is_final_event(
+            ApiFormat::AnthropicMessages,
+            &serde_json::json!({ "type": "message_stop" })
+        ));
+    }
+
+    #[test]
+    fn sse_data_reads_every_data_line_in_a_block() {
+        let event = "event: message\ndata: {\"a\":1}\r\ndata: [DONE]\n\n";
+        assert_eq!(sse_data(event), vec!["{\"a\":1}", "[DONE]"]);
+        assert!(sse_data("event: ping\n\n").is_empty());
+    }
 }

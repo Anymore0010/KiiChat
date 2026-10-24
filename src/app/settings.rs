@@ -121,6 +121,61 @@ impl KiiChat {
                 )
                 .into_any_element()
             }
+            Section::Chat => v_flex()
+                .gap_4()
+                .child(card(
+                    "系统提示词",
+                    v_flex()
+                        .gap_2()
+                        .child(Textarea::new(&self.system_input).w_full())
+                        .child(
+                            div().text_xs().text_color(muted).child(
+                                "每次发送都会把它放在对话最前面；留空则不发送。只保存在本机。",
+                            ),
+                        )
+                        .into_any_element(),
+                ))
+                .child(card(
+                    "采样温度",
+                    v_flex()
+                        .gap_2()
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .items_center()
+                                .child(
+                                    div()
+                                        .w(px(160.))
+                                        .child(Input::new(&self.temperature_input)),
+                                )
+                                .child(
+                                    div().text_xs().text_color(muted).child(
+                                        "0–2；越低越稳定，越高越发散。留空使用接口默认值。",
+                                    ),
+                                ),
+                        )
+                        .into_any_element(),
+                ))
+                .child(
+                    h_flex()
+                        .gap_3()
+                        .items_center()
+                        .child(
+                            Button::new("save-chat-params")
+                                .label("保存对话设置")
+                                .primary()
+                                .on_click(cx.listener(|this, _, _, cx| this.save_chat_params(cx))),
+                        )
+                        .when(!self.params_status.is_empty(), |this| {
+                            this.child(
+                                div()
+                                    .text_xs()
+                                    .text_color(muted)
+                                    .child(self.params_status.clone()),
+                            )
+                        }),
+                )
+                .into_any_element(),
             Section::Models => {
                 let selected = self.store.selected_provider.clone();
                 let editing = self.editor.id.clone();
@@ -350,8 +405,8 @@ impl KiiChat {
                             Button::new("delete-edited")
                                 .label("删除")
                                 .danger()
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.delete_provider(&id, window, cx);
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.request_delete_provider(&id, cx);
                                 })),
                         );
                 }

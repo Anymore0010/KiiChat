@@ -10,11 +10,15 @@ wrong API fails loudly instead of silently streaming.
 """
 
 import json
+import os
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = 18080
 MODELS = ["mock-mini", "mock-large", "mock-anthropic"]
+# `MOCK_SLOW=1` stretches the completion to ~10 s, long enough to drive the
+# stop button through UI Automation.
+SLOW = os.environ.get("MOCK_SLOW") == "1"
 
 
 def sse(handler, events):
@@ -72,9 +76,25 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.rstrip("/")
         auth = self.headers.get("Authorization", "")
         key = self.headers.get("x-api-key", "")
+        instructions = payload.get("instructions") or payload.get("system") or ""
+        if isinstance(instructions, list):
+            instructions = " ".join(
+                part.get("text", "") for part in instructions if isinstance(part, dict)
+            )
         print(
-            "POST %s model=%s stream=%s auth=%s x-api-key=%s"
-            % (path, payload.get("model"), payload.get("stream"), bool(auth), bool(key)),
+            "POST %s model=%s stream=%s auth=%s x-api-key=%s "
+            "max_tokens=%s max_output_tokens=%s temperature=%s system=%r"
+            % (
+                path,
+                payload.get("model"),
+                payload.get("stream"),
+                bool(auth),
+                bool(key),
+                payload.get("max_tokens"),
+                payload.get("max_output_tokens"),
+                payload.get("temperature"),
+                instructions,
+            ),
             flush=True,
         )
 
@@ -83,7 +103,21 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(
                     {"error": {"message": "chat/completions 需要 Bearer 与 messages"}}, 400
                 )
+            if not isinstance(payload.get("max_tokens"), int):
+                return self._json(
+                    {"error": {"message": "chat/completions 需要 max_tokens"}}, 400
+                )
+            if "temperature" in payload and not isinstance(payload["temperature"], (int, float)):
+                return self._json({"error": {"message": "temperature 必须是数字"}}, 400)
             self._sse_headers()
+            if SLOW:
+                for index in range(30):
+                    sse(self, [{"choices": [{"delta": {"content": f"片段{index} "}}]}])
+                    time.sleep(0.2)
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+                self.close_connection = True
+                return
             # reasoning first, then the answer, so the thinking strip is exercised.
             sse(self, [{"choices": [{"delta": {"reasoning_content": "先拆题…"}}]}])
             for piece in ["来自 ", "**chat** ", "completions。"]:
@@ -97,6 +131,14 @@ class Handler(BaseHTTPRequestHandler):
             if not auth.startswith("Bearer ") or "input" not in payload:
                 return self._json(
                     {"error": {"message": "responses 需要 Bearer 与 input"}}, 400
+                )
+            if not isinstance(payload.get("max_output_tokens"), int):
+                return self._json(
+                    {"error": {"message": "responses 需要 max_output_tokens"}}, 400
+                )
+            if "max_tokens" in payload:
+                return self._json(
+                    {"error": {"message": "responses 不应该收到 max_tokens"}}, 400
                 )
             self._sse_headers()
             sse(self, [{"type": "response.created"}])

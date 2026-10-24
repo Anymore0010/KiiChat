@@ -93,8 +93,8 @@ GPUI / gpui-component uses the system UI stack via font-kit. Do not bundle a web
 ## 5. Voice & Tone
 
 - **Register:** technical, calm, Chinese product UI. Instructional, not friendly-marketing.
-- **Sentence rhythm:** short clauses. Prefer verbs: 「获取模型」「新建对话」「失败重试」.
-- **Words this brand uses:** 「添加供应商」「获取模型」「新建对话」「选择模型」「失败重试」「以此消息为起点新建会话」.
+- **Sentence rhythm:** short clauses. Prefer verbs: 「获取模型」「新建对话」「重试」.
+- **Words this brand uses:** 「添加供应商」「获取模型」「新建对话」「选择模型」「重试」「以此消息为起点新建会话」.
 - **Words this brand refuses:** 「开启智能之旅」「赋能」「一键畅享」「无缝体验」「您的专属 AI 伙伴」「探索无限可能」.
 - **Address:** 「你」 implied by verb phrases; no 「您」 unless a confirm dialog needs formality. No second-person marketing copy on empty states — teach the next action, not the brand.
 

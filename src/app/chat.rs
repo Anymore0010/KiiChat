@@ -30,15 +30,22 @@ impl KiiChat {
                                 .w_full()
                                 .on_click(cx.listener(|this, _, _, cx| this.new_session(cx))),
                         ),
-                    )
-                    .child(
-                        div()
-                            .id("session-list")
-                            .flex_1()
-                            .min_h_0()
-                            .overflow_y_scrollbar()
-                            .child(v_flex().px_2().pb_2().gap(px(2.)).children(self.session_rows(cx))),
                     );
+                // The search box earns its row once the list is long enough to
+                // scan; below that it is chrome.
+                if self.store.sessions.len() >= SESSION_SEARCH_MIN {
+                    sidebar = sidebar.child(
+                        div().px_2().pb_1().child(Input::new(&self.session_search)),
+                    );
+                }
+                sidebar = sidebar.child(
+                    div()
+                        .id("session-list")
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_y_scrollbar()
+                        .child(v_flex().px_2().pb_2().gap(px(2.)).children(self.session_rows(cx))),
+                );
             }
             Page::Settings => {
                 let accent = theme.sidebar_accent;
@@ -60,28 +67,79 @@ impl KiiChat {
         let theme = cx.theme();
         let accent = theme.sidebar_accent;
         let accent_fg = theme.sidebar_accent_foreground;
-        self.store
-            .sessions
-            .iter()
-            .map(|session| {
-                let active = self.current.as_deref() == Some(session.id.as_str());
+        let sessions = self.visible_sessions(cx);
+        sessions
+            .into_iter()
+            .enumerate()
+            .map(|(ix, (id, title))| {
+                let active = self.current.as_deref() == Some(id.as_str());
+
+                // Rename replaces the row in place: the list keeps its shape
+                // instead of opening a dialog over the transcript.
+                if self.renaming.as_deref() == Some(id.as_str()) {
+                    let save = cx.listener(|this, _: &ClickEvent, _, cx: &mut Context<Self>| {
+                        this.submit_rename(cx);
+                    });
+                    let cancel = cx.listener(|this, _: &ClickEvent, _, cx: &mut Context<Self>| {
+                        this.cancel_rename(cx);
+                    });
+                    return h_flex()
+                        .id(("rename-session", ix))
+                        .gap_1()
+                        .px_1()
+                        .py_1()
+                        .child(div().flex_1().min_w_0().child(Input::new(&self.rename_input)))
+                        .child(
+                            Button::new("rename-save")
+                                .icon(IconName::Check)
+                                .ghost()
+                                .small()
+                                .tooltip("保存名称")
+                                .accessibility_label("保存名称")
+                                .on_click(save),
+                        )
+                        .child(
+                            Button::new("rename-cancel")
+                                .icon(IconName::Close)
+                                .ghost()
+                                .small()
+                                .tooltip("取消重命名")
+                                .accessibility_label("取消重命名")
+                                .on_click(cancel),
+                        )
+                        .into_any_element();
+                }
+
                 let select = cx.listener({
-                    let id = session.id.clone();
+                    let id = id.clone();
                     move |this: &mut Self, _: &ClickEvent, _, cx: &mut Context<Self>| {
                         this.select_session(&id, cx);
                     }
                 });
+                let rename = cx.listener({
+                    let id = id.clone();
+                    move |this: &mut Self,
+                          _: &ClickEvent,
+                          window: &mut Window,
+                          cx: &mut Context<Self>| {
+                        // A row button would otherwise bubble to the row's
+                        // select handler, which clears `renaming` immediately.
+                        cx.stop_propagation();
+                        this.begin_rename(&id, window, cx);
+                    }
+                });
                 let remove = cx.listener({
-                    let id = session.id.clone();
+                    let id = id.clone();
                     move |this: &mut Self, _: &ClickEvent, _, cx: &mut Context<Self>| {
-                        this.delete_session(&id, cx);
+                        cx.stop_propagation();
+                        this.request_delete_session(&id, cx);
                     }
                 });
                 h_flex()
-                    .id(SharedString::from(format!("session-{}", session.id)))
+                    .id(SharedString::from(format!("session-{}", id)))
                     .group("session-row")
                     .role(gpui::Role::Button)
-                    .aria_label(format!("会话：{}", session.title))
+                    .aria_label(format!("会话：{title}"))
                     .gap_1()
                     .pl_2()
                     .pr_1()
@@ -97,17 +155,32 @@ impl KiiChat {
                             .min_w_0()
                             .overflow_hidden()
                             .text_ellipsis()
-                            .child(session.title.clone()),
+                            .child(title),
                     )
                     .child(
-                        div().opacity(0.).group_hover("session-row", |this| this.opacity(1.)).child(
-                            Button::new(SharedString::from(format!("delete-{}", session.id)))
-                                .icon(IconName::Delete)
-                                .ghost()
-                                .small()
-                                .accessibility_label("删除会话")
-                                .on_click(remove),
-                        ),
+                        h_flex()
+                            .flex_none()
+                            .gap(px(1.))
+                            .opacity(0.)
+                            .group_hover("session-row", |this| this.opacity(1.))
+                            .child(
+                                Button::new(SharedString::from(format!("rename-{}", id)))
+                                    .icon(Icon::empty().path(icons::SQUARE_PEN_PATH))
+                                    .ghost()
+                                    .small()
+                                    .tooltip("重命名会话")
+                                    .accessibility_label("重命名会话")
+                                    .on_click(rename),
+                            )
+                            .child(
+                                Button::new(SharedString::from(format!("delete-{}", id)))
+                                    .icon(IconName::Delete)
+                                    .ghost()
+                                    .small()
+                                    .tooltip("删除会话")
+                                    .accessibility_label("删除会话")
+                                    .on_click(remove),
+                            ),
                     )
                     .into_any_element()
             })
@@ -216,8 +289,7 @@ impl KiiChat {
     pub(super) fn render_model_bar(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme();
         let current = self
-            .current_session()
-            .and_then(|session| session.model.clone())
+            .effective_model()
             .unwrap_or_else(|| "未选择模型".into());
         let provider = self
             .current
@@ -511,12 +583,14 @@ impl KiiChat {
             return div().into_any_element();
         };
         let theme = cx.theme();
+        let stopped_ink = theme.muted_foreground;
         let is_user = message.role == Role::User;
         let failed = message.error.as_deref().filter(|error| !error.is_empty());
         let streaming = self
             .stream
             .as_ref()
             .is_some_and(|stream| stream.message_id == message.id);
+        let stopped = message.stopped && !streaming;
         let editing = self
             .editing
             .as_ref()
@@ -589,6 +663,14 @@ impl KiiChat {
                 |this, strip| this.child(strip),
             )
             .child(body)
+            .when(stopped, |this| {
+                this.child(
+                    div()
+                        .text_xs()
+                        .text_color(stopped_ink)
+                        .child("已停止生成"),
+                )
+            })
             .when(!streaming && editing.is_none(), |this| {
                 this.child(self.render_actions(index, &message, failed.is_some(), window, cx))
             });
