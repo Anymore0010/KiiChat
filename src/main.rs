@@ -36,7 +36,7 @@ fn main() {
             cx.open_window(options, |window, cx| {
                 let view = cx.new(|cx| {
                     let mut view = KiiChat::new(window, cx);
-                    view.open(cx);
+                    view.open();
                     view
                 });
                 cx.new(|cx| Root::new(view, window, cx).bg(cx.theme().background))

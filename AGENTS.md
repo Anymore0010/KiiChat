@@ -22,7 +22,7 @@ ways.
 | `gpui-pre-platform` | `gpui_platform = ...` | Window/application bootstrap per OS |
 | `gpui-component` | `gpui-component` | Theme + palette, `Root`, `TitleBar`, `Button`, `Input`, `TextView`, scroll helpers |
 | `gpui-kit-assets` | `gpui-component-assets = { package = "gpui-kit-assets", ... }` | Bundled Lucide icons |
-| `gpui-ai` | `gpui-ai` | `PromptBar` (composer), `StreamingText` (streamed Markdown), `Orbs` (empty-conversation animation). Its `Chat` component is deliberately **not** used |
+| `gpui-ai` | `gpui-ai` | `StreamingText` (streamed Markdown) and `Orbs` (empty-conversation animation). Its `Chat` and `PromptBar` are deliberately **not** used |
 
 Rules:
 
@@ -37,13 +37,18 @@ Rules:
   copy/regenerate/edit/feedback with icons. This app needs no role headings,
   text actions (复制 / 分支 / 重试), a red 重试 state, and a branch action —
   none of which the component exposes. The transcript is therefore built here.
+- `gpui-ai`'s `PromptBar` was dropped too: it renders its own model chip (a
+  second selector beside this app's), English `Attach` / `Enhance` controls
+  that do nothing here, and an English placeholder. The composer is now a
+  borderless `Textarea` in the app's own frame, which also makes the model pill
+  the only selector.
 
 ## Layout
 
 ```
 src/main.rs           application bootstrap, window options, Root wiring
 src/app/mod.rs        view state, wiring, Render, free UI helpers
-src/app/chat.rs       sidebar, transcript, model bar, title bar, message rows
+src/app/chat.rs       sidebar, transcript, composer/model picker, title bar, message rows
 src/app/settings.rs   appearance / network / provider settings pages
 src/api.rs            OpenAI-compatible HTTP: /models, streaming chat, thinking deltas, proxy modes
 src/theme.rs          light/dark palette tokens and apply_theme
@@ -107,14 +112,16 @@ scripts/              dev tooling: fake provider server + UI Automation / captur
   is how a single bad field would otherwise destroy every provider.
 - **Fetched models are a menu, not a save.** `获取模型` fills `Editor::fetched`
   and the user ticks what to keep; only 保存 writes them into the provider.
-- **The composer's own model menu is not used for selection.** gpui-ai renders
-  it inside a popup layer; scrolling it with the wheel does nothing, so the
-  composer is handed only the current model and this app renders its own
-  searchable picker above the composer (`render_model_bar`).
-- **Proxy modes are resolved per request** in `api::client`: `System` keeps
-  reqwest's default (env + OS proxy), `None` calls `.no_proxy()`, `Custom`
-  installs `reqwest::Proxy::all(url)`. An empty custom URL is an error, not a
-  silent fallback.
+- **One model selector, across providers.** The composer is a custom
+  borderless `Textarea` in a framed card (`render_composer`); Enter sends,
+  Shift+Enter inserts a newline, and a rejected send keeps the draft.
+  `render_composer` / `render_model_picker` own the only selector: the panel
+  lists every provider's models, filters by model or provider name, and a row
+  binds both `session.provider_id` and `session.model`. 选择第一个 commits the
+  first filtered row. The pill lives in the composer's bottom row (DSH-style).
+  The popup is `deferred(anchored(...))` at `POPUP_PRIORITY`, positioned from
+  the pill's prepaint bounds, so it floats above the transcript and composer
+  without reflowing either; a transcript backdrop dismisses it.
 - **Errors surface in the UI.** A failed reply is stored in `Msg.error`, shown
   inside the bubble with a red border, and its retry action becomes a red
   「重试」 text button.

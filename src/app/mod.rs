@@ -16,13 +16,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use gpui::{
-    AnyElement, App, AppContext as _, ClickEvent, ClipboardItem, Context, ElementId, Entity,
+    AnyElement, App, AppContext as _, Bounds, ClickEvent, ClipboardItem, Context, ElementId, Entity,
     FollowMode, Hsla, IntoElement, ListAlignment, ListState, ParentElement, Render, SharedString,
     WindowControlArea, Pixels, Styled, Subscription, Window, div, list, prelude::*, px, relative,
 };
 use gpui_ai::orbs::Orbs;
-use gpui_ai::prompt_bar::{PromptBar, PromptBarEvent, PromptModel};
-use gpui_ai::stream::{ProgressState, StreamedContent};
+use gpui_ai::stream::StreamedContent;
 use gpui_ai::streaming_text::StreamingText;
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
@@ -30,8 +29,8 @@ use gpui_component::scroll::ScrollableElement as _;
 use gpui_component::text::TextView;
 
 use gpui_component::{
-    ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _,
-    StyledExt as _, h_flex, v_flex,
+    ActiveTheme as _, Disableable as _, ElementExt as _, Icon, IconName, Selectable as _,
+    Sizable as _, StyledExt as _, h_flex, v_flex,
 };
 
 use crate::api::{self, StreamEvent};
@@ -101,6 +100,14 @@ enum Confirm {
     Provider { id: String, name: String },
 }
 
+/// One model in the chat picker, tagged with the provider that serves it.
+#[derive(Clone)]
+struct PickRow {
+    provider_id: String,
+    provider_name: String,
+    model_id: String,
+}
+
 /// One in-flight completion.
 struct Stream {
     /// Monotonic id: a cancelled worker's late events must not reach the next
@@ -134,7 +141,7 @@ pub struct KiiChat {
     store: Store,
     page: Page,
     section: Section,
-    prompt: Entity<PromptBar>,
+    composer: Entity<TextareaState>,
     /// Transcript list state: variable-height rows, tail-following.
     transcript: ListState,
     current: Option<String>,
@@ -164,6 +171,9 @@ pub struct KiiChat {
     picker_search: Entity<InputState>,
     /// Whether the composer's model picker is open.
     picker_open: bool,
+    /// Window-space bounds of the model pill, used to anchor the floating
+    /// picker above it. Updated during prepaint.
+    model_pill_bounds: Bounds<Pixels>,
     /// Message ids whose reasoning strip is expanded.
     thinking_open: HashSet<String>,
     max_tokens_input: Entity<InputState>,
@@ -173,7 +183,12 @@ pub struct KiiChat {
 impl KiiChat {
 
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let prompt = cx.new(|cx| PromptBar::new("kiichat-prompt", window, cx));
+        let composer = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .auto_grow(1, 8)
+                .submit_on_enter(true)
+                .placeholder("发消息…")
+        });
         let transcript = ListState::new(0, ListAlignment::Bottom, px(256.));
         transcript.set_follow_mode(FollowMode::Tail);
 
@@ -204,13 +219,18 @@ impl KiiChat {
         let session_search = cx.new(|cx| InputState::new(window, cx).placeholder("搜索会话"));
         let rename_input = cx.new(|cx| InputState::new(window, cx).placeholder("会话名称"));
         // Each search box re-renders the view as it is typed into.
-        let mut subscriptions = vec![cx.subscribe_in(
-            &prompt,
+        let mut subscriptions = Vec::new();
+        subscriptions.push(cx.subscribe_in(
+            &composer,
             window,
-            |this: &mut Self, _, event: &PromptBarEvent, window, cx| {
-                this.on_prompt_event(event, window, cx);
+            |this: &mut Self, _, event: &InputEvent, window, cx| match event {
+                // The textarea only emits this for a non-shift Enter; Shift+Enter
+                // stays an ordinary newline.
+                InputEvent::PressEnter { shift: false, .. } => this.submit_composer(window, cx),
+                InputEvent::Change => cx.notify(),
+                _ => {}
             },
-        )];
+        ));
         let mut live_inputs = vec![
             &models_search,
             &picker_search,
@@ -267,7 +287,7 @@ impl KiiChat {
             store,
             page: Page::Chat,
             section: Section::Models,
-            prompt,
+            composer,
             transcript,
             current: None,
             stream: None,
@@ -289,6 +309,7 @@ impl KiiChat {
             models_search,
             picker_search,
             picker_open: false,
+            model_pill_bounds: Bounds::default(),
             thinking_open: HashSet::new(),
             max_tokens_input,
             _subscriptions: subscriptions,
@@ -310,6 +331,9 @@ impl KiiChat {
         // The window exists by now, so the stored color scheme applies to the
         // first frame instead of flashing the default one.
         apply_theme(theme_mode(this.store.theme), window, cx);
+        // Land in the composer, the one control this app is built around.
+        this.composer
+            .update(cx, |input, cx| input.focus(window, cx));
         if let Some(warning) = warning {
             this.notice = Some(warning.into());
         }
@@ -317,7 +341,7 @@ impl KiiChat {
     }
 
     /// Selects the conversation to show, creating one when the store is empty.
-    pub fn open(&mut self, cx: &mut Context<Self>) {
+    pub fn open(&mut self) {
         if self.store.sessions.is_empty() {
             self.store.sessions.push(Session::new());
         }
@@ -325,7 +349,6 @@ impl KiiChat {
             self.current = Some(self.store.sessions[0].id.clone());
         }
         self.sync_transcript(true);
-        self.sync_prompt(cx);
     }
 
     // ------------------------------------------------------------ state sync
@@ -364,55 +387,30 @@ impl KiiChat {
         }
     }
 
-    /// Points the composer's model picker at the conversation's provider.
-    fn sync_prompt(&mut self, cx: &mut Context<Self>) {
-        let provider = self
-            .current
-            .as_deref()
-            .and_then(|id| self.store.provider_for_session(id));
-        // Only the current model is handed to the composer: its own list cannot
-        // be scrolled with the wheel (the popup layer swallows the event), so
-        // selection happens in this app's searchable picker instead, and the
-        // composer slot just shows what is selected.
-        let model = self.effective_model();
-        let models: Vec<PromptModel> = model
+    /// The provider the current conversation actually talks to: its own
+    /// binding, else the globally selected one.
+    fn effective_provider_id(&self) -> Option<String> {
+        let session = self.current_session()?;
+        session
+            .provider_id
             .clone()
-            .filter(|model| provider.is_some_and(|provider| provider.has_model(model)))
-            .map(|model| {
-                vec![PromptModel::new(model.clone(), model.clone()).provider(
-                    provider.map(|provider| provider.name.clone()).unwrap_or_default(),
-                )]
-            })
-            .unwrap_or_default();
-        let selected = model.filter(|model| models.iter().any(|candidate| candidate.id() == model));
-
-        self.prompt.update(cx, |prompt, cx| {
-            prompt.set_models(models, cx);
-            if let Some(model) = selected {
-                prompt.set_selected_model(model, cx);
-            }
-        });
+            .or_else(|| self.store.selected_provider.clone())
+            .filter(|id| self.store.provider(id).is_some())
     }
 
     /// The model a conversation will actually use: its own choice when the
     /// current provider offers it, else the provider's first model.
     ///
     /// New conversations and provider switches both rely on this fallback, so
-    /// the composer's chip and the request path must read the same value.
+    /// the model chip and the request path must read the same value.
     fn effective_model(&self) -> Option<String> {
         let provider = self
-            .current
-            .as_deref()
-            .and_then(|id| self.store.provider_for_session(id))?;
+            .store
+            .provider(&self.effective_provider_id()?)?;
         self.current_session()
             .and_then(|session| session.model.clone())
             .filter(|model| provider.has_model(model))
             .or_else(|| provider.models.first().map(|model| model.id.clone()))
-    }
-
-    fn set_progress(&mut self, progress: ProgressState, cx: &mut Context<Self>) {
-        self.prompt
-            .update(cx, |prompt, cx| prompt.set_progress(progress, cx));
     }
 
     // ----------------------------------------------------------------- theme
@@ -432,31 +430,6 @@ impl KiiChat {
     }
 
     // ---------------------------------------------------------------- events
-
-    fn on_prompt_event(
-        &mut self,
-        event: &PromptBarEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        match event {
-            PromptBarEvent::Submit { submission, .. } => {
-                let text = submission.text().to_string();
-                let model = submission.model_id().cloned();
-                self.send(text, model, window, cx);
-            }
-            PromptBarEvent::ModelChanged { model_id, .. } => {
-                if let Some(id) = self.current.clone() {
-                    if let Some(session) = self.store.session_mut(&id) {
-                        session.model = Some(model_id.to_string());
-                    }
-                    self.persist(cx);
-                }
-            }
-            PromptBarEvent::CancelRequested { .. } => self.cancel_stream(cx),
-            _ => {}
-        }
-    }
 
     /// Resolves the provider and model a completion in this conversation needs.
     ///
@@ -479,27 +452,35 @@ impl KiiChat {
         Some((session_id, provider, model))
     }
 
-    fn send(
-        &mut self,
-        text: String,
-        model: Option<SharedString>,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let text = text.trim().to_string();
+    /// Submits the composer draft. The draft survives a rejected turn so the
+    /// user does not lose a long message to a missing provider or model.
+    fn submit_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self.composer.read(cx).value().trim().to_string();
         if text.is_empty() || self.stream.is_some() {
             return;
         }
-        let Some((session_id, provider, fallback_model)) = self.target(cx) else {
-            return;
+        if self.send(text, cx) {
+            self.composer.update(cx, |input, cx| {
+                input.set_value("", window, cx);
+                input.focus(window, cx);
+            });
+        }
+    }
+
+    fn send(&mut self, text: String, cx: &mut Context<Self>) -> bool {
+        let text = text.trim().to_string();
+        if text.is_empty() || self.stream.is_some() {
+            return false;
+        }
+        let Some((session_id, provider, model)) = self.target(cx) else {
+            return false;
         };
-        let model = model.map(|model| model.to_string()).unwrap_or(fallback_model);
 
         let placeholder = Msg::new(Role::Assistant, "");
         let message_id = placeholder.id.clone();
         let request = {
             let Some(session) = self.store.session_mut(&session_id) else {
-                return;
+                return false;
             };
             if session.title == DEFAULT_TITLE {
                 session.title = title_from(&text);
@@ -510,6 +491,7 @@ impl KiiChat {
         };
         self.notice = None;
         self.launch(session_id, provider, model, message_id, request, cx);
+        true
     }
 
     /// Re-runs the completion that failed, dropping it and everything after it.
@@ -658,7 +640,6 @@ impl KiiChat {
         self.current = Some(id);
         self.page = Page::Chat;
         self.sync_transcript(true);
-        self.sync_prompt(cx);
         self.persist(cx);
         cx.notify();
     }
@@ -681,7 +662,6 @@ impl KiiChat {
             message_id,
             cancel: cancel.clone(),
         });
-        self.set_progress(ProgressState::Running, cx);
         self.sync_transcript(true);
         cx.notify();
 
@@ -807,7 +787,6 @@ impl KiiChat {
         if let Some(row) = row {
             self.transcript.remeasure_items(row..row + 1);
         }
-        self.set_progress(ProgressState::Pending, cx);
         self.sync_transcript(false);
         self.persist(cx);
         cx.notify();
@@ -827,7 +806,6 @@ impl KiiChat {
         if let Some(row) = row {
             self.transcript.remeasure_items(row..row + 1);
         }
-        self.set_progress(ProgressState::Pending, cx);
         self.sync_transcript(false);
         self.persist(cx);
         cx.notify();
@@ -865,7 +843,6 @@ impl KiiChat {
         self.confirm = None;
         self.renaming = None;
         self.sync_transcript(true);
-        self.sync_prompt(cx);
         self.persist(cx);
         cx.notify();
     }
@@ -880,7 +857,6 @@ impl KiiChat {
         self.renaming = None;
         self.confirm = None;
         self.sync_transcript(true);
-        self.sync_prompt(cx);
         cx.notify();
     }
 
@@ -929,7 +905,7 @@ impl KiiChat {
         }
         if self.current.as_deref() == Some(id) {
             self.current = None;
-            self.open(cx);
+            self.open();
         }
         self.persist(cx);
         cx.notify();
@@ -1185,7 +1161,6 @@ impl KiiChat {
         self.editor.status = "已保存。".into();
         self.notice = None;
         self.persist(cx);
-        self.sync_prompt(cx);
         cx.notify();
     }
 
@@ -1203,7 +1178,6 @@ impl KiiChat {
             self.edit_provider(None, window, cx);
         }
         self.persist(cx);
-        self.sync_prompt(cx);
         cx.notify();
     }
 
@@ -1222,7 +1196,6 @@ impl KiiChat {
     fn select_provider(&mut self, id: &str, cx: &mut Context<Self>) {
         self.store.selected_provider = Some(id.to_string());
         self.persist(cx);
-        self.sync_prompt(cx);
         cx.notify();
     }
 
@@ -1304,22 +1277,74 @@ impl KiiChat {
             .collect()
     }
 
-    /// The models the composer's picker offers, matching its search box.
-    fn picker_matching(&self, cx: &App) -> Vec<String> {
+    /// Every model from every provider, matching the picker search box.
+    ///
+    /// One list across providers means switching endpoint and model is a single
+    /// choice; selecting a row binds both to the conversation.
+    fn picker_rows(&self, cx: &App) -> Vec<PickRow> {
         let query = self.picker_search.read(cx).value().trim().to_lowercase();
-        let Some(provider) = self
-            .current
-            .as_deref()
-            .and_then(|id| self.store.provider_for_session(id))
-        else {
-            return Vec::new();
+        let mut rows = Vec::new();
+        for provider in &self.store.providers {
+            for model in &provider.models {
+                let matches = query.is_empty()
+                    || model.id.to_lowercase().contains(&query)
+                    || provider.name.to_lowercase().contains(&query);
+                if matches {
+                    rows.push(PickRow {
+                        provider_id: provider.id.clone(),
+                        provider_name: provider.name.clone(),
+                        model_id: model.id.clone(),
+                    });
+                }
+            }
+        }
+        rows
+    }
+
+    fn open_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.picker_open = true;
+        self.picker_search.update(cx, |input, cx| {
+            input.set_value("", window, cx);
+            input.focus(window, cx);
+        });
+        cx.notify();
+    }
+
+    fn close_picker(&mut self, cx: &mut Context<Self>) {
+        if self.picker_open {
+            self.picker_open = false;
+            cx.notify();
+        }
+    }
+
+    /// Binds a provider and model to the current conversation.
+    fn pick_model(
+        &mut self,
+        provider_id: &str,
+        model_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(id) = self.current.clone() else {
+            return;
         };
-        provider
-            .models
-            .iter()
-            .map(|model| model.id.clone())
-            .filter(|id| query.is_empty() || id.to_lowercase().contains(&query))
-            .collect()
+        if let Some(session) = self.store.session_mut(&id) {
+            session.provider_id = Some(provider_id.to_string());
+            session.model = Some(model_id.to_string());
+        }
+        self.picker_open = false;
+        self.persist(cx);
+        self.composer
+            .update(cx, |input, cx| input.focus(window, cx));
+        cx.notify();
+    }
+
+    /// Enter in the picker search picks the first match.
+    fn pick_first_match(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(row) = self.picker_rows(cx).into_iter().next() else {
+            return;
+        };
+        self.pick_model(&row.provider_id, &row.model_id, window, cx);
     }
 
     /// Adds or removes one catalog row in the settings drawer.
@@ -1342,19 +1367,6 @@ impl KiiChat {
     pub(super) fn close_models_drawer(&mut self, cx: &mut Context<Self>) {
         self.editor.drawer_open = false;
         self.save_provider(cx);
-    }
-
-    fn pick_model(&mut self, model: &str, cx: &mut Context<Self>) {
-        let Some(id) = self.current.clone() else {
-            return;
-        };
-        if let Some(session) = self.store.session_mut(&id) {
-            session.model = Some(model.to_string());
-        }
-        self.picker_open = false;
-        self.persist(cx);
-        self.sync_prompt(cx);
-        cx.notify();
     }
 
     // ---------------------------------------------------------------- render

@@ -275,75 +275,63 @@ impl KiiChat {
                 .into_any_element()
         };
 
-        pane.child(div().flex_1().min_h_0().child(body))
-            .child(self.render_model_bar(cx))
-            .child(div().flex_none().child(self.prompt.clone()))
-            .into_any_element()
+        // The backdrop covers the transcript while the picker floats above the
+        // composer; the popup is deferred, so it does not reflow anything.
+        let backdrop = self.picker_open.then(|| {
+            div()
+                .id("picker-backdrop")
+                .absolute()
+                .inset_0()
+                .on_click(cx.listener(|this, _, _, cx| this.close_picker(cx)))
+                .into_any_element()
+        });
+
+        pane.child(
+            div()
+                .flex_1()
+                .min_h_0()
+                .relative()
+                .child(body)
+                .when_some(backdrop, |this, backdrop| this.child(backdrop)),
+        )
+        .child(self.render_composer(cx))
+        .into_any_element()
     }
 
-    /// The model row above the composer, and its picker when open.
-    ///
-    /// The composer's own model menu cannot be scrolled with the wheel (the
-    /// popup layer swallows the event), so selection lives here: a left-aligned
-    /// panel under the model chip, not a sibling inside the bar row.
-    pub(super) fn render_model_bar(&self, cx: &mut Context<Self>) -> AnyElement {
+    /// The model picker: a deferred, anchored popup above the composer's model
+    /// pill. It lists every provider's models, so switching endpoint and model
+    /// is one choice.
+    pub(super) fn render_model_picker(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme();
-        let current = self
-            .effective_model()
-            .unwrap_or_else(|| "未选择模型".into());
-        let provider = self
-            .current
-            .as_deref()
-            .and_then(|id| self.store.provider_for_session(id))
-            .map(|provider| provider.name.clone());
-
-        let bar = h_flex()
-            .flex_none()
-            .justify_between()
-            .gap_2()
-            .px_1()
-            .child(
-                Button::new("open-picker")
-                    .label(current.clone())
-                    .icon(IconName::ChevronsUpDown)
-                    .ghost()
-                    .small()
-                    .tooltip("选择模型")
-                    .accessibility_label("选择模型")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.picker_open = !this.picker_open;
-                        cx.notify();
-                    })),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(provider.unwrap_or_default()),
-            );
-
-        if !self.picker_open {
-            return bar.into_any_element();
-        }
-
-        let matching = self.picker_matching(cx);
-        let rows: Vec<AnyElement> = matching
-            .iter()
+        let muted = theme.muted_foreground;
+        let rows = self.picker_rows(cx);
+        let current_provider = self.effective_provider_id();
+        let current_model = self.effective_model();
+        let result_count = rows.len();
+        let row_elements: Vec<AnyElement> = rows
+            .into_iter()
             .enumerate()
-            .map(|(ix, model)| {
-                let is_current = current == *model;
+            .map(|(ix, row)| {
+                let is_current = current_provider.as_deref() == Some(row.provider_id.as_str())
+                    && current_model.as_deref() == Some(row.model_id.as_str());
                 let select = cx.listener({
-                    let model = model.clone();
-                    move |this: &mut Self, _: &ClickEvent, _, cx: &mut Context<Self>| {
-                        this.pick_model(&model, cx);
+                    let provider_id = row.provider_id.clone();
+                    let model_id = row.model_id.clone();
+                    move |this: &mut Self,
+                          _: &ClickEvent,
+                          window: &mut Window,
+                          cx: &mut Context<Self>| {
+                        this.pick_model(&provider_id, &model_id, window, cx);
                     }
                 });
                 h_flex()
                     .id(("pick-model", ix))
                     .role(gpui::Role::Button)
-                    .aria_label(format!("模型：{model}"))
+                    .aria_label(format!("模型：{}（{}）", row.model_id, row.provider_name))
+                    .justify_between()
+                    .gap_2()
                     .px_2()
-                    .py_1()
+                    .py(px(6.))
                     .rounded(theme.radius)
                     .text_sm()
                     .cursor_pointer()
@@ -351,57 +339,263 @@ impl KiiChat {
                         this.bg(theme.accent).text_color(theme.accent_foreground)
                     })
                     .on_click(select)
-                    .child(model.clone())
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .child(row.model_id.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_xs()
+                            .text_color(if is_current {
+                                theme.accent_foreground
+                            } else {
+                                muted
+                            })
+                            .child(row.provider_name.clone()),
+                    )
+                    .when(is_current, |this| {
+                        this.child(Icon::new(IconName::Check).small())
+                    })
                     .into_any_element()
             })
             .collect();
 
-        let empty = rows.is_empty();
+        let empty = row_elements.is_empty();
+        let needs_setup = self
+            .store
+            .providers
+            .iter()
+            .all(|provider| provider.models.is_empty());
+        let open_settings = cx.listener(|this, _, window, cx| {
+            this.picker_open = false;
+            this.show_settings(window, cx);
+        });
+        let close = cx.listener(|this, _, _, cx| this.close_picker(cx));
+
+        let panel_body: AnyElement = if empty {
+            v_flex()
+                .gap_2()
+                .p_1()
+                .text_xs()
+                .text_color(muted)
+                .child(if self.store.providers.is_empty() {
+                    "还没有供应商。"
+                } else if needs_setup {
+                    "供应商还没有模型，先去获取模型。"
+                } else {
+                    "没有匹配的模型。"
+                })
+                .when(needs_setup, |this| {
+                    this.child(
+                        Button::new("picker-open-settings")
+                            .label("打开设置")
+                            .small()
+                            .on_click(open_settings),
+                    )
+                })
+                .into_any_element()
+        } else {
+            v_flex()
+                .gap(px(2.))
+                .children(row_elements)
+                .into_any_element()
+        };
+
         let panel = v_flex()
             .id("model-picker-panel")
+            .occlude()
+            .w(px(360.))
+            .max_w(relative(0.92))
             .gap_2()
-            .p_2()
-            .mb_2()
-            .w(px(340.))
-            .max_w(relative(0.9))
-            .rounded(theme.radius_lg)
+            .p_3()
+            .rounded(px(12.))
             .border_1()
             .border_color(theme.border)
             .bg(theme.popover)
+            .child(
+                h_flex()
+                    .justify_between()
+                    .items_center()
+                    .child(div().text_sm().font_semibold().child("选择模型"))
+                    .child(
+                        Button::new("close-picker")
+                            .icon(IconName::Close)
+                            .ghost()
+                            .small()
+                            .tooltip("关闭")
+                            .accessibility_label("关闭模型选择")
+                            .on_click(close),
+                    ),
+            )
             .child(Input::new(&self.picker_search))
             .child(
                 div()
                     .id("model-picker-list")
-                    .max_h(px(220.))
+                    .max_h(px(280.))
                     .overflow_y_scrollbar()
-                    .child(if empty {
-                        v_flex()
-                            .p_2()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(if self.store.providers.is_empty() {
-                                "还没有供应商，先去「设置 → 模型」添加。"
-                            } else if self
-                                .current
-                                .as_deref()
-                                .and_then(|id| self.store.provider_for_session(id))
-                                .is_some_and(|provider| provider.models.is_empty())
-                            {
-                                "这个供应商还没有模型，先去「设置 → 模型」获取。"
-                            } else {
-                                "没有匹配的模型。"
-                            })
-                            .into_any_element()
-                    } else {
-                        v_flex().gap(px(2.)).children(rows).into_any_element()
+                    .child(panel_body),
+            )
+            .child(
+                h_flex()
+                    .justify_between()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div().flex_1().min_w_0().text_xs().text_color(muted).child(if empty {
+                            "选择后会同时切换该会话的供应商与模型。".to_string()
+                        } else {
+                            format!("{result_count} 个模型")
+                        }),
+                    )
+                    .when(!empty, |this| {
+                        this.child(
+                            Button::new("pick-first")
+                                .label("选择第一个")
+                                .small()
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.pick_first_match(window, cx);
+                                })),
+                        )
                     }),
             );
 
+        // The pill's bounds are in window space; anchoring the popup's
+        // bottom-right corner there makes it grow upward from the composer,
+        // over the transcript, with no layout shift.
+        let anchor = gpui::point(
+            self.model_pill_bounds.origin.x + self.model_pill_bounds.size.width,
+            self.model_pill_bounds.origin.y,
+        );
+        gpui::deferred(
+            gpui::anchored()
+                .position(anchor)
+                .anchor(gpui::Anchor::BottomRight)
+                .snap_to_window_with_margin(px(12.))
+                .child(panel),
+        )
+        .with_priority(gpui_base::POPUP_PRIORITY)
+        .into_any_element()
+    }
+
+    /// The app's composer: a DSH-style card with the model pill and a round
+    /// send / stop control on its bottom row.
+    pub(super) fn render_composer(&self, cx: &mut Context<Self>) -> AnyElement {
+        let popup = self.picker_open.then(|| self.render_model_picker(cx));
+        let theme = cx.theme();
+        let muted = theme.muted_foreground;
+        let running = self.stream.is_some();
+        let has_draft = !self.composer.read(cx).value().trim().is_empty();
+        let submit = cx.listener(|this, _, window, cx| this.submit_composer(window, cx));
+        let stop = cx.listener(|this, _, _, cx| this.cancel_stream(cx));
+        let current = self
+            .effective_model()
+            .unwrap_or_else(|| "选择模型".into());
+        let provider = self
+            .effective_provider_id()
+            .and_then(|id| self.store.provider(&id))
+            .map(|provider| provider.name.clone());
+
+        let toggle = cx.listener(|this, _, window, cx| {
+            if this.picker_open {
+                this.close_picker(cx);
+            } else {
+                this.open_picker(window, cx);
+            }
+        });
+        let trigger = Button::new("open-picker")
+            .label(current)
+            .icon(IconName::ChevronsUpDown)
+            .secondary()
+            .small()
+            .rounded(px(10.))
+            .accessibility_label("选择模型")
+            .on_click(toggle);
+        // A tooltip over the pill would paint on top of the popup while the
+        // popup is open; it is only useful as a closed-state affordance.
+        let trigger = if self.picker_open {
+            trigger
+        } else {
+            trigger.tooltip(match provider {
+                Some(provider) => format!("选择模型 · {provider}"),
+                None => "选择模型".to_string(),
+            })
+        };
+
+        // Record the pill's window-space bounds so the deferred popup can hang
+        // above it without being an absolute child of this small row.
+        let state = cx.entity();
+        let pill = div()
+            .on_prepaint(move |bounds, _, cx| {
+                state.update(cx, |this, _| {
+                    this.model_pill_bounds = bounds;
+                });
+            })
+            .child(trigger);
+
         v_flex()
             .flex_none()
-            .items_start()
-            .child(bar)
-            .child(panel)
+            .gap_2()
+            .p_3()
+            .rounded(px(16.))
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.popover)
+            .child(
+                Textarea::new(&self.composer)
+                    .appearance(false)
+                    .bordered(false)
+                    .w_full()
+                    .min_h(px(40.)),
+            )
+            .child(
+                h_flex()
+                    .justify_between()
+                    .items_center()
+                    .gap_2()
+                    .child(div().text_xs().text_color(muted).child(if running {
+                        "生成中，可随时停止"
+                    } else {
+                        "Enter 发送 · Shift+Enter 换行"
+                    }))
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(pill)
+                            .child(if running {
+                                Button::new("composer-stop")
+                                    .icon(IconName::Pause)
+                                    .primary()
+                                    .rounded_full()
+                                    .w(px(32.))
+                                    .h(px(32.))
+                                    .justify_center()
+                                    .tooltip("停止生成")
+                                    .accessibility_label("停止生成")
+                                    .on_click(stop)
+                                    .into_any_element()
+                            } else {
+                                Button::new("composer-send")
+                                    .icon(IconName::ArrowUp)
+                                    .primary()
+                                    .rounded_full()
+                                    .w(px(32.))
+                                    .h(px(32.))
+                                    .justify_center()
+                                    .disabled(!has_draft)
+                                    .tooltip("发送")
+                                    .accessibility_label("发送")
+                                    .on_click(submit)
+                                    .into_any_element()
+                            }),
+                    ),
+            )
+            .children(popup)
             .into_any_element()
     }
 
@@ -565,7 +759,7 @@ impl KiiChat {
                     .text_color(theme.muted_foreground)
                     .text_center()
                     .child(if has_provider {
-                        "在下方输入消息，回车发送。点左上角模型名可以切换模型。"
+                        "在下方输入消息，Enter 发送。点输入框上方的模型名可以切换供应商与模型。"
                     } else {
                         "先点右上角齿轮，到「模型」添加一个 OpenAI 兼容的接口，再回来对话。"
                     }),

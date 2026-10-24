@@ -78,10 +78,10 @@ GPUI / gpui-component uses the system UI stack via font-kit. Do not bundle a web
 ### 3d. Component seeds
 
 - **Button:** three variants only — `primary` (filled accent, one per screen), `ghost` (icon + optional short label), `danger-text` (failed retry, delete confirm). Never six equal-weight CTAs.
-- **Card / container:** almost none. Settings groups are sections separated by hairline dividers and a 12–14 px section title, not shadowed cards. Popovers (model picker) get a 1 px border + popover surface, radius 8, no drop-shadow theater.
+- **Card / container:** almost none. Settings groups are sections separated by hairline dividers and a 12–14 px section title, not shadowed cards. Popovers (model picker) get a 1 px border + popover surface and a 12 px radius, no drop-shadow theater.
 - **Iconography:** Lucide via `gpui-kit-assets` (stroke 1.5–2, 14–16 px). Two local SVGs (branch, pencil) must match that weight. Icon-only controls always carry tooltip + accessibility label.
-- **Radius:** 6 (controls), 8 (bubbles, panels). No 12/16 “soft SaaS” corners.
-- **Composer:** PromptBar keeps its place; height ~44–56 px; model chip sits *above* the input left-aligned (see Structure), not as a popup layer.
+- **Radius:** 6 (controls), 8 (bubbles, panels), 16 for the composer card and its floating picker, which follow the DSH-style input rather than the tool-chrome grid.
+- **Composer:** a borderless multiline field inside a 16 px-radius framed card (DSH-style). The input comes first; a bottom row holds a muted hint on the left and the model pill + round send/stop button on the right. The model pill is *inside* that row, and its picker is a floating popover above the card, never a layout sibling.
 
 ## 4. Accessibility
 
@@ -115,7 +115,7 @@ GPUI / gpui-component uses the system UI stack via font-kit. Do not bundle a web
 - **No emoji as UI decoration.** Icons are Lucide; copy is Chinese verbs.
 - **No card grid for settings.** Sections + hairlines; forms are linear.
 - **No reasoning dumped as raw JSON or interleaved without affordance.** Thinking is a collapsed strip, default closed after completion.
-- **No 16 px rounded soft-sass corners or drop-shadow popovers.** Radius 8 max, border over shadow.
+- **No soft-sass card grid or drop-shadow popovers.** Radius 8 for panels, 12–16 only for the DSH-style composer and its picker; border over shadow.
 - **No feature-page language inside the product** (「探索更多模型」).
 
 ## 8. Decision-Making
