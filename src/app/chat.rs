@@ -8,6 +8,8 @@ impl KiiChat {
         let sidebar_bg = theme.sidebar;
         let sidebar_border = theme.sidebar_border;
         let sidebar_fg = theme.sidebar_foreground;
+        let radius = theme.radius;
+        let accent = theme.sidebar_accent;
 
         let mut sidebar = v_flex()
             .w(px(SIDEBAR_WIDTH))
@@ -46,18 +48,70 @@ impl KiiChat {
                         .overflow_y_scrollbar()
                         .child(v_flex().px_2().pb_2().gap(px(2.)).children(self.session_rows(cx))),
                 );
+                // Settings is a destination of the sidebar, not a title-bar
+                // utility: it sits below the conversation list and becomes
+                // 「返回对话」 on the settings page.
+                sidebar = sidebar.child(
+                    div()
+                        .p_2()
+                        .border_t_1()
+                        .border_color(sidebar_border)
+                        .child(
+                            h_flex()
+                                .id("sidebar-settings")
+                                .role(gpui::Role::Button)
+                                .aria_label("设置")
+                                .gap_2()
+                                .px_2()
+                                .py_2()
+                                .rounded(radius)
+                                .text_sm()
+                                .cursor_pointer()
+                                .hover(move |style| style.bg(accent))
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.show_settings(window, cx);
+                                }))
+                                .child(Icon::new(IconName::Settings).small())
+                                .child(div().child("设置")),
+                        ),
+                );
             }
             Page::Settings => {
-                let accent = theme.sidebar_accent;
                 let accent_fg = theme.sidebar_accent_foreground;
-                sidebar = sidebar.child(
-                    div().flex_1().min_h_0().overflow_y_scrollbar().child(
-                        v_flex()
-                            .gap(px(2.))
+                sidebar = sidebar
+                    .child(
+                        div().flex_1().min_h_0().overflow_y_scrollbar().child(
+                            v_flex()
+                                .gap(px(2.))
+                                .p_2()
+                                .children(self.section_rows(accent, accent_fg, cx)),
+                        ),
+                    )
+                    .child(
+                        div()
                             .p_2()
-                            .children(self.section_rows(accent, accent_fg, cx)),
-                    ),
-                );
+                            .border_t_1()
+                            .border_color(sidebar_border)
+                            .child(
+                                h_flex()
+                                    .id("sidebar-back")
+                                    .role(gpui::Role::Button)
+                                    .aria_label("返回对话")
+                                    .gap_2()
+                                    .px_2()
+                                    .py_2()
+                                    .rounded(radius)
+                                    .text_sm()
+                                    .cursor_pointer()
+                                    .hover(move |style| style.bg(accent))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.page = Page::Chat;
+                                        cx.notify();
+                                    }))
+                                    .child(Icon::new(IconName::ArrowLeft).small())
+                                    .child(div().child("返回对话")),
+                            ),
+                    );
             }
         }
         sidebar.into_any_element()
@@ -669,8 +723,13 @@ impl KiiChat {
                     .tooltip(if dark { "切换到浅色" } else { "切换到深色" })
                     .accessibility_label("切换深浅色")
                     .on_click(cx.listener(|this, _, window, cx| this.toggle_theme(window, cx))),
-            )
-            .child(
+            );
+
+        // The sidebar owns the settings entry while it is open. The title-bar
+        // slot keeps three jobs: a fallback settings button when the sidebar is
+        // collapsed, and the back button on the settings page.
+        if in_settings || collapsed {
+            bar = bar.child(
                 Button::new("toggle-page")
                     .icon(if in_settings {
                         IconName::ArrowLeft
@@ -690,6 +749,7 @@ impl KiiChat {
                         }
                     })),
             );
+        }
 
         // macOS draws its own controls; everywhere else the platform hit-tests
         // the areas below (Windows) or we drive them by hand.
@@ -759,9 +819,9 @@ impl KiiChat {
                     .text_color(theme.muted_foreground)
                     .text_center()
                     .child(if has_provider {
-                        "在下方输入消息，Enter 发送。点输入框上方的模型名可以切换供应商与模型。"
+                        "在下方输入消息，Enter 发送。点输入框右下角的模型名可以切换供应商与模型。"
                     } else {
-                        "先点右上角齿轮，到「模型」添加一个 OpenAI 兼容的接口，再回来对话。"
+                        "先点左侧栏底部的「设置」，到「模型」添加一个 OpenAI 兼容的接口，再回来对话。"
                     }),
             )
             .into_any_element()

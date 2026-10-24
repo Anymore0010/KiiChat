@@ -106,6 +106,11 @@ scripts/              dev tooling: fake provider server + UI Automation / captur
   armed by the trash icon and committed from the bar rendered above the page.
   Deleting a conversation also cancels its stream, drops a rename in progress,
   and creates a fresh conversation when the store empties.
+- **Settings is a sidebar destination.** `sidebar-settings` sits in the footer
+  below the conversation list; on the settings page the same slot becomes
+  `sidebar-back` (「返回对话」). The title-bar `toggle-page` slot is a settings
+  fallback only while the sidebar is collapsed, and is always the back button
+  on the settings page. Entering settings clears an open model picker.
 - **A config the app cannot read is moved aside, never ignored.** `Store::load`
   returns the store plus a warning; on a parse error the file becomes
   `config.json.invalid` and the UI explains it. Starting empty and then saving
@@ -325,6 +330,9 @@ Only what has been observed, with the evidence that showed it:
 - Empty successful replies become a red error with retry instead of placeholder
   assistant text being sent back as context.
 - Editing and retry are refused with a notice while a reply is streaming.
+- Settings moved into the sidebar footer; the same slot is 「返回对话」 on the
+  settings page, and the title-bar slot is a collapsed-sidebar fallback / back
+  button.
 - Filled primary buttons now use the app's accent blue: `apply_theme` rebuilds
   the cached `Theme.tokens` snapshot after writing the palette (the upstream
   theme cache kept `button_primary` black regardless of `colors.primary`).

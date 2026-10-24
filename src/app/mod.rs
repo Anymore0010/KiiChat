@@ -1042,6 +1042,7 @@ impl KiiChat {
             self.edit_provider(selected.as_ref(), window, cx);
         }
         self.page = Page::Settings;
+        self.picker_open = false;
         cx.notify();
     }
 
